@@ -36,3 +36,5 @@ app.use(express.json());
 
 app.use("/customers", customers);
 app.use("/orders", orders);
+
+export default app;
