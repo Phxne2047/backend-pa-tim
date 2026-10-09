@@ -46,8 +46,9 @@ router.get("/", async (req, res) => {
 router.get("/near", async (req, res) => {
     try {
         const distanceKm = req.query.km ? parseFloat(req.query.km as string) : 2.0;
-        const shopLat = SHOP_CONFIG.latitude;
-        const shopLng = SHOP_CONFIG.longitude;
+        const targetLat = req.query.lat ? parseFloat(req.query.lat as string) : SHOP_CONFIG.latitude;
+        const targetLng = req.query.lng ? parseFloat(req.query.lng as string) : SHOP_CONFIG.longitude;
+
 
         const sql = `
             SELECT o.*, c.name,c.phone,c.address,c.latitude,c.longitude,    
@@ -58,7 +59,7 @@ router.get("/near", async (req, res) => {
             ORDER BY o.id ASC
         `;
 
-        const [rows]: any = await conn.query(sql, [shopLng, shopLat, distanceKm]);
+        const [rows]: any = await conn.query(sql, [targetLng, targetLat, distanceKm]);
         res.json(rows);
     } catch (error) {
         console.error("Error fetching nearby orders:", error);

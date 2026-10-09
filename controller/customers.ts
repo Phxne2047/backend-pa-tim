@@ -18,8 +18,8 @@ router.get("/", async (req, res) => {
 router.get("/near", async (req, res) => {
     try {
         const distanceKm = req.query.km ? parseFloat(req.query.km as string) : 1.0;
-        const shopLat = SHOP_CONFIG.latitude;
-        const shopLng = SHOP_CONFIG.longitude;
+        const targetLat = req.query.lat ? parseFloat(req.query.lat as string) : SHOP_CONFIG.latitude;
+        const targetLng = req.query.lng ? parseFloat(req.query.lng as string) : SHOP_CONFIG.longitude;
 
         const sql = `
             SELECT *, 
@@ -29,7 +29,7 @@ router.get("/near", async (req, res) => {
             ORDER BY distance_km ASC
         `;
 
-        const [rows] = await conn.query(sql, [shopLng, shopLat, distanceKm]);
+        const [rows] = await conn.query(sql, [targetLng, targetLat, distanceKm]);
         res.json(rows);
     } catch (error) {
         console.error("Error fetching nearby customers:", error);
@@ -39,9 +39,10 @@ router.get("/near", async (req, res) => {
 
 router.get("/search", async (req, res) => {
     try {
+        const name = req.query.name || '';
         const [rows] = await conn.query(
-            "SELECT * FROM customers WHERE (id IS NULL OR id = ?) OR (name IS NULL OR name LIKE ?)",
-            [req.query.id, "%" + req.query.name + "%"]
+            "SELECT * FROM customers WHERE name LIKE ?",
+            [`%${name}%`]
         );
         res.json(rows);
     } catch (error) {
