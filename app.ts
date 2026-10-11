@@ -5,11 +5,20 @@ import cors from "cors";
 
 export const app = express();
 
-// const allowedOrigins = [
-//     "http://127.0.0.1:5500",
-//     "http://localhost:3000",
-//     "https://your-production-frontend.com",
-// ];
+const allowedOrigins = [
+    "http://127.0.0.1:5500",
+    "http://localhost:3000",
+    "http://localhost:4200",
+    "https://backend-pa-tim.vercel.app/",
+];
+
+app.use(
+    cors({
+        origin: "*",
+        methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Content-Type", "Authorization"],
+    })
+);
 
 // app.use(
 //     cors({
