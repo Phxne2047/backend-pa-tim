@@ -7,12 +7,21 @@ exports.app = void 0;
 const express_1 = __importDefault(require("express"));
 const customers_1 = require("./controller/customers");
 const orders_1 = require("./controller/orders");
+const riders_1 = require("./controller/riders");
+const delivery_routes_1 = require("./controller/delivery-routes");
+const cors_1 = __importDefault(require("cors"));
 exports.app = (0, express_1.default)();
-// const allowedOrigins = [
-//     "http://127.0.0.1:5500",
-//     "http://localhost:3000",
-//     "https://your-production-frontend.com",
-// ];
+const allowedOrigins = [
+    "http://127.0.0.1:5500",
+    "http://localhost:3000",
+    "http://localhost:4200",
+    "https://backend-pa-tim.vercel.app/",
+];
+exports.app.use((0, cors_1.default)({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+}));
 // app.use(
 //     cors({
 //         origin: function (origin, callback) {
@@ -33,4 +42,7 @@ exports.app.use(express_1.default.text());
 exports.app.use(express_1.default.json());
 exports.app.use("/customers", customers_1.router);
 exports.app.use("/orders", orders_1.router);
+exports.app.use("/riders", riders_1.router);
+exports.app.use("/delivery-routes", delivery_routes_1.router);
+exports.default = exports.app;
 //# sourceMappingURL=app.js.map

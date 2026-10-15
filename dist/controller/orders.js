@@ -46,8 +46,8 @@ exports.router.get("/", async (req, res) => {
 exports.router.get("/near", async (req, res) => {
     try {
         const distanceKm = req.query.km ? parseFloat(req.query.km) : 2.0;
-        const shopLat = shop_1.SHOP_CONFIG.latitude;
-        const shopLng = shop_1.SHOP_CONFIG.longitude;
+        const targetLat = req.query.lat ? parseFloat(req.query.lat) : shop_1.SHOP_CONFIG.latitude;
+        const targetLng = req.query.lng ? parseFloat(req.query.lng) : shop_1.SHOP_CONFIG.longitude;
         const sql = `
             SELECT o.*, c.name,c.phone,c.address,c.latitude,c.longitude,    
             ROUND((ST_Distance_Sphere(point(c.longitude, c.latitude), point(?, ?)) / 1000), 2) AS distance_km
@@ -56,7 +56,7 @@ exports.router.get("/near", async (req, res) => {
             HAVING distance_km <= ?
             ORDER BY o.id ASC
         `;
-        const [rows] = await dbconnect_1.conn.query(sql, [shopLng, shopLat, distanceKm]);
+        const [rows] = await dbconnect_1.conn.query(sql, [targetLng, targetLat, distanceKm]);
         res.json(rows);
     }
     catch (error) {
@@ -147,6 +147,9 @@ exports.router.post("/mock", async (req, res) => {
 exports.router.post("/", async (req, res) => {
     try {
         let order = req.body;
+        if (order.boxes > 3) {
+            return res.status(400).json({ error: "An order cannot contain more than 3 boxes" });
+        }
         let sql = "INSERT INTO `orders`(`customer_id`, `boxes`, `status`, `menu`) VALUES (?,?,?,?)";
         const [result] = await dbconnect_1.conn.query(sql, [
             order.customer_id,

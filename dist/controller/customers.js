@@ -18,8 +18,8 @@ exports.router.get("/", async (req, res) => {
 exports.router.get("/near", async (req, res) => {
     try {
         const distanceKm = req.query.km ? parseFloat(req.query.km) : 1.0;
-        const shopLat = shop_1.SHOP_CONFIG.latitude;
-        const shopLng = shop_1.SHOP_CONFIG.longitude;
+        const targetLat = req.query.lat ? parseFloat(req.query.lat) : shop_1.SHOP_CONFIG.latitude;
+        const targetLng = req.query.lng ? parseFloat(req.query.lng) : shop_1.SHOP_CONFIG.longitude;
         const sql = `
             SELECT *, 
             ROUND((ST_Distance_Sphere(point(longitude, latitude), point(?, ?)) / 1000), 2) AS distance_km 
@@ -27,7 +27,7 @@ exports.router.get("/near", async (req, res) => {
             HAVING distance_km <= ? 
             ORDER BY distance_km ASC
         `;
-        const [rows] = await dbconnect_1.conn.query(sql, [shopLng, shopLat, distanceKm]);
+        const [rows] = await dbconnect_1.conn.query(sql, [targetLng, targetLat, distanceKm]);
         res.json(rows);
     }
     catch (error) {
@@ -37,7 +37,8 @@ exports.router.get("/near", async (req, res) => {
 });
 exports.router.get("/search", async (req, res) => {
     try {
-        const [rows] = await dbconnect_1.conn.query("SELECT * FROM customers WHERE (id IS NULL OR id = ?) OR (name IS NULL OR name LIKE ?)", [req.query.id, "%" + req.query.name + "%"]);
+        const name = req.query.name || '';
+        const [rows] = await dbconnect_1.conn.query("SELECT * FROM customers WHERE name LIKE ?", [`%${name}%`]);
         res.json(rows);
     }
     catch (error) {

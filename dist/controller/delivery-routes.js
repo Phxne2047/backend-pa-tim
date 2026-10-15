@@ -1,0 +1,468 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.router = void 0;
+const express_1 = __importDefault(require("express"));
+const dbconnect_1 = require("../dbconnect");
+const shop_1 = require("../config/shop");
+exports.router = express_1.default.Router();
+function calculateDistance(lat1, lon1, lat2, lon2) {
+    const x = (lat1 - lat2) * 111;
+    const y = (lon1 - lon2) * 111;
+    const distance = Math.sqrt(x * x + y * y);
+    return Number(distance.toFixed(2));
+}
+exports.router.get("/", async (req, res) => {
+    try {
+        const [rows] = await dbconnect_1.conn.query("SELECT * FROM delivery_routes");
+        let deliveryRoutes = rows;
+        res.json(deliveryRoutes);
+    }
+    catch (error) {
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+exports.router.post("/", async (req, res) => {
+    try {
+        let deliveryRoute = req.body;
+        let sql = "INSERT INTO `delivery_routes`(`rider_id`, `job_code`, `total_orders`, `total_boxes`, `total_distance`, `time_delivery`, `delivery_peice`, `net_profit`, `status`) VALUES (?,?,?,?,?,?,?,?,?)";
+        const [result] = await dbconnect_1.conn.query(sql, [
+            deliveryRoute.rider_id,
+            deliveryRoute.job_code,
+            deliveryRoute.total_orders,
+            deliveryRoute.total_boxes,
+            deliveryRoute.total_distance,
+            deliveryRoute.time_delivery,
+            deliveryRoute.delivery_peice,
+            deliveryRoute.net_profit,
+            deliveryRoute.status || "pending",
+        ]);
+        const insertResult = result;
+        res.status(201).json({
+            affected_row: insertResult.affectedRows,
+            last_idx: insertResult.insertId
+        });
+    }
+    catch (error) {
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+exports.router.post("/optimize", async (req, res) => {
+    try {
+        const shopLat = shop_1.SHOP_CONFIG.latitude;
+        const shopLng = shop_1.SHOP_CONFIG.longitude;
+        await dbconnect_1.conn.query("UPDATE orders SET status = 'pending' WHERE status = 'assigned'");
+        const [orderRows] = await dbconnect_1.conn.query(`
+            SELECT o.id, o.customer_id, o.boxes, o.menu, o.status,
+                   c.name AS customer_name, c.phone AS customer_phone, c.address, c.latitude, c.longitude
+            FROM orders o
+            INNER JOIN customers c ON o.customer_id = c.id
+            WHERE o.status = 'pending'
+            ORDER BY o.id ASC
+        `);
+        const orders = orderRows;
+        if (orders.length === 0) {
+            return res.status(400).json({ error: "ไม่พบออเดอร์ที่พร้อมจัดส่งในระบบ" });
+        }
+        const [riderRows] = await dbconnect_1.conn.query("SELECT * FROM riders");
+        const riders = riderRows;
+        if (riders.length === 0) {
+            return res.status(400).json({ error: "ไม่พบข้อมูลไรเดอร์ในระบบ" });
+        }
+        await dbconnect_1.conn.query("DELETE FROM route_stops");
+        await dbconnect_1.conn.query("DELETE FROM delivery_routes");
+        let unassigned = [...orders];
+        const groups = [];
+        while (unassigned.length > 0) {
+            const currentGroup = [];
+            let currentBoxes = 0;
+            //ออเดอร์แรก
+            const firstOrder = unassigned.shift();
+            currentGroup.push(firstOrder);
+            currentBoxes += firstOrder.boxes;
+            //ออเดอร์ใกล้สุด
+            while (currentGroup.length < 3 && unassigned.length > 0) {
+                const lastPoint = currentGroup[currentGroup.length - 1];
+                let bestIndex = -1;
+                let minDistance = Infinity;
+                for (let i = 0; i < unassigned.length; i++) {
+                    const candidate = unassigned[i];
+                    if (currentBoxes + candidate.boxes <= 10) {
+                        const dist = calculateDistance(Number(lastPoint.latitude), Number(lastPoint.longitude), Number(candidate.latitude), Number(candidate.longitude));
+                        if (dist < minDistance) {
+                            minDistance = dist;
+                            bestIndex = i;
+                        }
+                    }
+                }
+                if (bestIndex !== -1) {
+                    const chosen = unassigned.splice(bestIndex, 1)[0];
+                    currentGroup.push(chosen);
+                    currentBoxes += chosen.boxes;
+                }
+                else {
+                    break;
+                }
+            }
+            groups.push(currentGroup);
+        }
+        const createdRoutes = [];
+        let totalAllBoxes = 0;
+        let totalAllOrders = 0;
+        let totalAllDeliveryCost = 0;
+        let maxDeliveryTime = 0;
+        //สร้างเส้นให้ไรเดอร์
+        for (let i = 0; i < groups.length; i++) {
+            const group = groups[i];
+            const rider = riders[i % riders.length];
+            const jobCode = `JOB-${String(i + 1).padStart(2, "0")}`;
+            let totalGroupBoxes = 0;
+            let totalGroupDistance = 0;
+            let prevLat = shopLat;
+            let prevLng = shopLng;
+            const stopsData = [];
+            let cumulativeTime = 0;
+            for (let j = 0; j < group.length; j++) {
+                const ord = group[j];
+                totalGroupBoxes += ord.boxes;
+                const dist = calculateDistance(prevLat, prevLng, Number(ord.latitude), Number(ord.longitude));
+                totalGroupDistance += dist;
+                const timeForThisLeg = dist * 2;
+                cumulativeTime += timeForThisLeg;
+                stopsData.push({
+                    order: ord,
+                    stop_number: j + 1,
+                    distance_before: dist,
+                    total_time: Number(cumulativeTime.toFixed(1)),
+                });
+                prevLat = Number(ord.latitude);
+                prevLng = Number(ord.longitude);
+            }
+            totalGroupDistance = Number(totalGroupDistance.toFixed(2));
+            const timeDelivery = Number((totalGroupDistance * 2).toFixed(1));
+            const deliveryFee = Number((shop_1.SHOP_CONFIG.rider_base_fee + totalGroupDistance * shop_1.SHOP_CONFIG.rider_fee_per_km_box * totalGroupBoxes).toFixed(2));
+            const netProfit = Number((totalGroupBoxes * (shop_1.SHOP_CONFIG.box_price - shop_1.SHOP_CONFIG.food_cost) - deliveryFee).toFixed(2));
+            const insertRouteSql = `
+                INSERT INTO delivery_routes (rider_id, job_code, total_orders, total_boxes, total_distance, time_delivery, delivery_peice, net_profit, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            `;
+            const [routeResult] = await dbconnect_1.conn.query(insertRouteSql, [
+                rider.id,
+                jobCode,
+                group.length,
+                totalGroupBoxes,
+                totalGroupDistance,
+                timeDelivery,
+                deliveryFee,
+                netProfit,
+            ]);
+            const routeId = routeResult.insertId;
+            const savedStops = [];
+            for (const stop of stopsData) {
+                const insertStopSql = `
+                    INSERT INTO route_stops (route_id, order_id, stop_number, distance_before, total_time, status)
+                    VALUES (?, ?, ?, ?, ?, 'pending')
+                `;
+                const [stopResult] = await dbconnect_1.conn.query(insertStopSql, [
+                    routeId,
+                    stop.order.id,
+                    stop.stop_number,
+                    stop.distance_before,
+                    stop.total_time,
+                ]);
+                await dbconnect_1.conn.query("UPDATE orders SET status = 'assigned' WHERE id = ?", [stop.order.id]);
+                const lat = Number(stop.order.latitude);
+                const lng = Number(stop.order.longitude);
+                savedStops.push({
+                    stop_id: stopResult.insertId,
+                    stop_number: stop.stop_number,
+                    order_id: stop.order.id,
+                    customer_name: stop.order.customer_name,
+                    customer_phone: stop.order.customer_phone,
+                    address: stop.order.address,
+                    boxes: stop.order.boxes,
+                    menu: stop.order.menu,
+                    latitude: lat,
+                    longitude: lng,
+                    distance_from_prev_km: stop.distance_before,
+                    cumulative_time_min: stop.total_time,
+                    google_map_url: `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`,
+                    status: "pending",
+                });
+            }
+            totalAllBoxes += totalGroupBoxes;
+            totalAllOrders += group.length;
+            totalAllDeliveryCost += deliveryFee;
+            if (timeDelivery > maxDeliveryTime) {
+                maxDeliveryTime = timeDelivery;
+            }
+            createdRoutes.push({
+                route_id: routeId,
+                job_code: jobCode,
+                rider_id: rider.id,
+                rider_name: rider.name,
+                rider_phone: rider.phone,
+                route_color: rider.color,
+                total_orders: group.length,
+                total_boxes: totalGroupBoxes,
+                total_distance_km: totalGroupDistance,
+                estimated_time_min: timeDelivery,
+                delivery_fee: deliveryFee,
+                net_profit: netProfit,
+                status: "pending",
+                stops: savedStops,
+            });
+        }
+        //แดชบอรืด
+        const totalRevenue = totalAllBoxes * shop_1.SHOP_CONFIG.box_price;
+        const totalFoodCost = totalAllBoxes * shop_1.SHOP_CONFIG.food_cost;
+        const totalGrossProfit = totalAllBoxes * (shop_1.SHOP_CONFIG.box_price - shop_1.SHOP_CONFIG.food_cost);
+        const totalNetProfit = Number((totalGrossProfit - totalAllDeliveryCost).toFixed(2));
+        const dashboard = {
+            total_orders: totalAllOrders,
+            total_boxes: totalAllBoxes,
+            total_riders_used: createdRoutes.length,
+            total_revenue: totalRevenue,
+            total_food_cost: totalFoodCost,
+            total_gross_profit: totalGrossProfit,
+            total_delivery_cost: Number(totalAllDeliveryCost.toFixed(2)),
+            net_profit: totalNetProfit,
+            max_delivery_time_min: maxDeliveryTime,
+            is_risk_loss: totalNetProfit < 0,
+            is_risk_late: maxDeliveryTime > 60,
+        };
+        res.status(200).json({
+            message: "จัดเส้นทางสำเร็จเรียบร้อยแล้ว",
+            shop: {
+                name: shop_1.SHOP_CONFIG.name,
+                address: shop_1.SHOP_CONFIG.address,
+                latitude: shopLat,
+                longitude: shopLng,
+            },
+            financial_dashboard: dashboard,
+            routes: createdRoutes,
+        });
+    }
+    catch (error) {
+        console.error("Error optimizing routes:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+exports.router.get("/all", async (req, res) => {
+    try {
+        const [routeRows] = await dbconnect_1.conn.query(`
+            SELECT dr.*, r.name AS rider_name, r.phone AS rider_phone, r.color AS route_color
+            FROM delivery_routes dr
+            LEFT JOIN riders r ON dr.rider_id = r.id
+            ORDER BY dr.id ASC
+        `);
+        if (routeRows.length === 0) {
+            return res.status(200).json({
+                shop: {
+                    name: shop_1.SHOP_CONFIG.name,
+                    address: shop_1.SHOP_CONFIG.address,
+                    latitude: shop_1.SHOP_CONFIG.latitude,
+                    longitude: shop_1.SHOP_CONFIG.longitude,
+                },
+                financial_dashboard: null,
+                routes: [],
+            });
+        }
+        const [stopRows] = await dbconnect_1.conn.query(`
+            SELECT rs.*, o.boxes, o.menu, c.name AS customer_name, c.phone AS customer_phone, c.address, c.latitude, c.longitude
+            FROM route_stops rs
+            LEFT JOIN orders o ON rs.order_id = o.id
+            LEFT JOIN customers c ON o.customer_id = c.id
+            ORDER BY rs.route_id ASC, rs.stop_number ASC
+        `);
+        let totalAllBoxes = 0;
+        let totalAllOrders = 0;
+        let totalAllDeliveryCost = 0;
+        let maxDeliveryTime = 0;
+        const routes = routeRows.map((route) => {
+            const stops = stopRows
+                .filter((s) => s.route_id === route.id)
+                .map((s) => {
+                const lat = Number(s.latitude);
+                const lng = Number(s.longitude);
+                return {
+                    stop_id: s.id,
+                    stop_number: s.stop_number,
+                    order_id: s.order_id,
+                    customer_name: s.customer_name,
+                    customer_phone: s.customer_phone,
+                    address: s.address,
+                    boxes: s.boxes,
+                    menu: s.menu,
+                    latitude: lat,
+                    longitude: lng,
+                    distance_from_prev_km: Number(s.distance_before),
+                    cumulative_time_min: Number(s.total_time),
+                    google_map_url: `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`,
+                    status: s.status,
+                };
+            });
+            const boxes = Number(route.total_boxes);
+            const deliveryFee = Number(route.delivery_peice);
+            const timeDelivery = Number(route.time_delivery);
+            totalAllBoxes += boxes;
+            totalAllOrders += Number(route.total_orders);
+            totalAllDeliveryCost += deliveryFee;
+            if (timeDelivery > maxDeliveryTime) {
+                maxDeliveryTime = timeDelivery;
+            }
+            return {
+                route_id: route.id,
+                job_code: route.job_code,
+                rider_id: route.rider_id,
+                rider_name: route.rider_name,
+                rider_phone: route.rider_phone,
+                route_color: route.route_color,
+                total_orders: route.total_orders,
+                total_boxes: boxes,
+                total_distance_km: Number(route.total_distance),
+                estimated_time_min: timeDelivery,
+                delivery_fee: deliveryFee,
+                net_profit: Number(route.net_profit),
+                status: route.status,
+                stops: stops,
+            };
+        });
+        const totalRevenue = totalAllBoxes * shop_1.SHOP_CONFIG.box_price;
+        const totalFoodCost = totalAllBoxes * shop_1.SHOP_CONFIG.food_cost;
+        const totalGrossProfit = totalAllBoxes * (shop_1.SHOP_CONFIG.box_price - shop_1.SHOP_CONFIG.food_cost);
+        const totalNetProfit = Number((totalGrossProfit - totalAllDeliveryCost).toFixed(2));
+        const dashboard = {
+            total_orders: totalAllOrders,
+            total_boxes: totalAllBoxes,
+            total_riders_used: routes.length,
+            total_revenue: totalRevenue,
+            total_food_cost: totalFoodCost,
+            total_gross_profit: totalGrossProfit,
+            total_delivery_cost: Number(totalAllDeliveryCost.toFixed(2)),
+            net_profit: totalNetProfit,
+            max_delivery_time_min: maxDeliveryTime,
+            is_risk_loss: totalNetProfit < 0,
+            is_risk_late: maxDeliveryTime > 60,
+        };
+        res.status(200).json({
+            shop: {
+                name: shop_1.SHOP_CONFIG.name,
+                address: shop_1.SHOP_CONFIG.address,
+                latitude: shop_1.SHOP_CONFIG.latitude,
+                longitude: shop_1.SHOP_CONFIG.longitude,
+            },
+            financial_dashboard: dashboard,
+            routes: routes,
+        });
+    }
+    catch (error) {
+        console.error("Error fetching latest routes:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+exports.router.get("/job/:jobCode", async (req, res) => {
+    try {
+        const jobCode = req.params.jobCode;
+        const [routeRows] = await dbconnect_1.conn.query(`
+            SELECT dr.*, r.name AS rider_name, r.phone AS rider_phone
+            FROM delivery_routes dr
+            LEFT JOIN riders r ON dr.rider_id = r.id
+            WHERE dr.job_code = ?
+        `, [jobCode]);
+        if (routeRows.length === 0) {
+            return res.status(404).json({ error: "ไม่พบใบงานตามรหัสที่ระบุ" });
+        }
+        const route = routeRows[0];
+        const [stopRows] = await dbconnect_1.conn.query(`
+            SELECT rs.*, o.boxes, o.menu, c.name AS customer_name, c.phone AS customer_phone, c.address, c.latitude, c.longitude
+            FROM route_stops rs
+            LEFT JOIN orders o ON rs.order_id = o.id
+            LEFT JOIN customers c ON o.customer_id = c.id
+            WHERE rs.route_id = ?
+            ORDER BY rs.stop_number ASC
+        `, [route.id]);
+        const stops = stopRows.map((s) => {
+            const lat = Number(s.latitude);
+            const lng = Number(s.longitude);
+            return {
+                step: s.stop_number,
+                stop_id: s.id,
+                order_id: s.order_id,
+                customer_name: s.customer_name,
+                customer_phone: s.customer_phone,
+                address: s.address,
+                boxes: s.boxes,
+                menu: s.menu,
+                latitude: lat,
+                longitude: lng,
+                status: s.status,
+                distance_before: Number(s.distance_before),
+                total_time: Number(s.total_time),
+                google_maps_nav_url: `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`,
+            };
+        });
+        res.status(200).json({
+            job_code: route.job_code,
+            rider_name: route.rider_name,
+            rider_phone: route.rider_phone,
+            status: route.status,
+            pickup_summary: {
+                total_boxes_to_pickup: route.total_boxes,
+                total_stops: route.total_orders,
+                total_distance_km: Number(route.total_distance),
+                estimated_time_min: Number(route.time_delivery),
+                expected_earnings_baht: Number(route.delivery_peice),
+            },
+            delivery_sequence: stops,
+        });
+    }
+    catch (error) {
+        console.error("Error fetching job details:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+exports.router.patch("/stops/:stopId/status", async (req, res) => {
+    try {
+        const stopId = parseInt(req.params.stopId, 10);
+        const { status } = req.body;
+        const newStatus = status || "delivered";
+        const [stopRows] = await dbconnect_1.conn.query("SELECT * FROM route_stops WHERE id = ?", [stopId]);
+        if (stopRows.length === 0) {
+            return res.status(404).json({ error: "ไม่พบข้อมูลจุดส่งนี้" });
+        }
+        const stop = stopRows[0];
+        await dbconnect_1.conn.query("UPDATE route_stops SET status = ?, delivered_at = NOW() WHERE id = ?", [newStatus, stopId]);
+        await dbconnect_1.conn.query("UPDATE orders SET status = ? WHERE id = ?", [newStatus, stop.order_id]);
+        const [allStops] = await dbconnect_1.conn.query("SELECT status FROM route_stops WHERE route_id = ?", [stop.route_id]);
+        const allDelivered = allStops.every((s) => s.status === "delivered");
+        if (allDelivered) {
+            await dbconnect_1.conn.query("UPDATE delivery_routes SET status = 'completed' WHERE id = ?", [stop.route_id]);
+        }
+        res.status(200).json({
+            message: "อัปเดตสถานะจัดส่งสำเร็จ",
+            stop_id: stopId,
+            status: newStatus,
+            all_route_completed: allDelivered,
+        });
+    }
+    catch (error) {
+        console.error("Error updating stop status:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+exports.router.delete("/all", async (req, res) => {
+    try {
+        await dbconnect_1.conn.query("DELETE FROM route_stops");
+        await dbconnect_1.conn.query("DELETE FROM delivery_routes");
+        await dbconnect_1.conn.query("UPDATE orders SET status = 'pending' WHERE status = 'assigned'");
+        res.status(200).json({ message: "รีเซ็ตรอบจัดส่งเรียบร้อยแล้ว" });
+    }
+    catch (error) {
+        console.error("Error resetting delivery routes:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+//# sourceMappingURL=delivery-routes.js.map
