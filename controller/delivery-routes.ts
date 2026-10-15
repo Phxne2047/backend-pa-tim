@@ -6,21 +6,121 @@ import { SHOP_CONFIG } from "../config/shop";
 export const router = express.Router();
 const OSRM_BASE_URL = process.env.OSRM_BASE_URL || "https://router.project-osrm.org";
 
+
+//คำนวณระยะทางตามถนนจริงด้วย OSRM
 async function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): Promise<number> {
-    try {
-        const url = `${OSRM_BASE_URL}/route/v1/driving/${lon1},${lat1};${lon2},${lat2}?overview=false`;
-        const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
-        const data: any = await res.json();
-        if (data.code === "Ok" && data.routes?.[0]) {
-            return Number((data.routes[0].distance / 1000).toFixed(2));
-        }
-    } catch (e) {
-        // หาก OSRM มีปัญหาหรือเน็ตหลุด ให้ Fallback กลับมาใช้สูตรเส้นตรงอัตโนมัติ
+    const url = `${OSRM_BASE_URL}/route/v1/driving/${lon1},${lat1};${lon2},${lat2}?overview=false`;
+    const res = await fetch(url);
+    const data: any = await res.json();
+    if (data.code === "Ok" && data.routes?.[0]) {
+        return Number((data.routes[0].distance / 1000).toFixed(2));
     }
-    const x = (lat1 - lat2) * 111;
-    const y = (lon1 - lon2) * 111;
-    return Number(Math.sqrt(x * x + y * y).toFixed(2));
+    return 0;
 }
+
+//คำนวณระยะทางจัดกลุ่มออเดอร์ที่อยู่ใกล้เคียงกัน
+function getApproxDistance(p1: any, p2: any): number {
+    const dx = (Number(p1.latitude) - Number(p2.latitude)) * 111;
+    const dy = (Number(p1.longitude) - Number(p2.longitude)) * 111;
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+//จัดกลุ่มออเดอร์ด้วย Knapsack
+function groupOrdersKnapsack(orders: any[]): any[][] {
+    let unassigned = [...orders].sort((a, b) => b.boxes - a.boxes || a.id - b.id);
+    const groups: any[][] = [];
+
+    while (unassigned.length > 0) {
+        const seed = unassigned[0]!;
+        const remaining = unassigned.slice(1);
+
+        let bestSubset: any[] = [];
+        let maxBoxes = seed.boxes;
+        let minDistance = Infinity;
+
+        //เพิ่ม 1 ออเดอร์
+        for (let i = 0; i < remaining.length; i++) {
+            const item1 = remaining[i]!;
+            const totalB = seed.boxes + item1.boxes;
+            if (totalB <= 10) {
+                const d = getApproxDistance(seed, item1);
+                if (totalB > maxBoxes || (totalB === maxBoxes && d < minDistance)) {
+                    maxBoxes = totalB;
+                    minDistance = d;
+                    bestSubset = [item1];
+                }
+            }
+        }
+
+        //เพิ่ม 2 ออเดอร์
+        for (let i = 0; i < remaining.length; i++) {
+            for (let j = i + 1; j < remaining.length; j++) {
+                const item1 = remaining[i]!;
+                const item2 = remaining[j]!;
+                const totalB = seed.boxes + item1.boxes + item2.boxes;
+                if (totalB <= 10) {
+                    const d = getApproxDistance(seed, item1) + getApproxDistance(seed, item2) + getApproxDistance(item1, item2);
+                    if (totalB > maxBoxes || (totalB === maxBoxes && d < minDistance)) {
+                        maxBoxes = totalB;
+                        minDistance = d;
+                        bestSubset = [item1, item2];
+                    }
+                }
+            }
+        }
+
+        const currentGroup = [seed, ...bestSubset];
+        groups.push(currentGroup);
+
+        const chosenIds = new Set(currentGroup.map((o) => o.id));
+        unassigned = unassigned.filter((o) => !chosenIds.has(o.id));
+    }
+
+    return groups;
+}
+
+//สลับลำดับจุดส่งในกลุ่มให้สั้นที่สุด
+function getPermutations<T>(arr: T[]): T[][] {
+    if (arr.length <= 1) return [arr];
+    const result: T[][] = [];
+    for (let i = 0; i < arr.length; i++) {
+        const current = arr[i]!;
+        const remaining = arr.slice(0, i).concat(arr.slice(i + 1));
+        for (const p of getPermutations(remaining)) {
+            result.push([current, ...p]);
+        }
+    }
+    return result;
+}
+
+async function findOptimalRoute(shopLat: number, shopLng: number, group: any[]): Promise<any[]> {
+    if (group.length <= 1) return group;
+
+    const allPermutations = getPermutations(group);
+    let bestPermutation = group;
+    let minTotalDist = Infinity;
+
+    for (const perm of allPermutations) {
+        let totalDist = 0;
+        let prevLat = shopLat;
+        let prevLng = shopLng;
+
+        for (const ord of perm) {
+            const dist = await calculateDistance(prevLat, prevLng, Number(ord.latitude), Number(ord.longitude));
+            totalDist += dist;
+            prevLat = Number(ord.latitude);
+            prevLng = Number(ord.longitude);
+        }
+
+        if (totalDist < minTotalDist) {
+            minTotalDist = totalDist;
+            bestPermutation = perm;
+        }
+    }
+
+    return bestPermutation;
+}
+
 
 router.get("/", async (req, res) => {
     try {
@@ -52,7 +152,7 @@ router.post("/", async (req, res) => {
         const insertResult = result as any;
         res.status(201).json({
             affected_row: insertResult.affectedRows,
-            last_idx: insertResult.insertId
+            last_idx: insertResult.insertId,
         });
     } catch (error) {
         res.status(500).json({ error: "Internal server error" });
@@ -87,51 +187,8 @@ router.post("/optimize", async (req, res) => {
         await conn.query("DELETE FROM route_stops");
         await conn.query("DELETE FROM delivery_routes");
 
-        let unassigned = [...orders];
-        const groups: any[][] = [];
-
-        while (unassigned.length > 0) {
-            const currentGroup: any[] = [];
-            let currentBoxes = 0;
-
-            //ออเดอร์แรก
-            const firstOrder = unassigned.shift()!;
-            currentGroup.push(firstOrder);
-            currentBoxes += firstOrder.boxes;
-
-            //ออเดอร์ใกล้สุด
-            while (currentGroup.length < 3 && unassigned.length > 0) {
-                const lastPoint = currentGroup[currentGroup.length - 1];
-                let bestIndex = -1;
-                let minDistance = Infinity;
-
-                for (let i = 0; i < unassigned.length; i++) {
-                    const candidate = unassigned[i];
-                    if (currentBoxes + candidate.boxes <= 10) {
-                        const dist = await calculateDistance(
-                            Number(lastPoint.latitude),
-                            Number(lastPoint.longitude),
-                            Number(candidate.latitude),
-                            Number(candidate.longitude)
-                        );
-                        if (dist < minDistance) {
-                            minDistance = dist;
-                            bestIndex = i;
-                        }
-                    }
-                }
-
-                if (bestIndex !== -1) {
-                    const chosen = unassigned.splice(bestIndex, 1)[0];
-                    currentGroup.push(chosen);
-                    currentBoxes += chosen.boxes;
-                } else {
-                    break;
-                }
-            }
-
-            groups.push(currentGroup);
-        }
+        // ขั้นที่ 1: จัดกลุ่มออเดอร์ (Knapsack)
+        const groups = groupOrdersKnapsack(orders);
 
         const createdRoutes: any[] = [];
         let totalAllBoxes = 0;
@@ -139,30 +196,27 @@ router.post("/optimize", async (req, res) => {
         let totalAllDeliveryCost = 0;
         let maxDeliveryTime = 0;
 
-        //สร้างเส้นให้ไรเดอร์
+        // ขั้นที่ 2: วิ่งหาลำดับส่งที่ดีที่สุดสำหรับแต่ละกลุ่ม และสร้างเส้นทาง
         for (let i = 0; i < groups.length; i++) {
             const group = groups[i]!;
             const rider = riders[i % riders.length]!;
             const jobCode = `JOB-${String(i + 1).padStart(2, "0")}`;
 
+            // หาเส้นทางที่สั้นที่สุดในกลุ่ม (TSP: 3! = 6 รูปแบบ)
+            const optimalStops = await findOptimalRoute(shopLat, shopLng, group);
+
             let totalGroupBoxes = 0;
             let totalGroupDistance = 0;
+            let cumulativeTime = 0;
             let prevLat = shopLat;
             let prevLng = shopLng;
-
             const stopsData: any[] = [];
-            let cumulativeTime = 0;
 
-            for (let j = 0; j < group.length; j++) {
-                const ord = group[j]!;
+            for (let j = 0; j < optimalStops.length; j++) {
+                const ord = optimalStops[j]!;
                 totalGroupBoxes += ord.boxes;
 
-                const dist = await calculateDistance(
-                    prevLat,
-                    prevLng,
-                    Number(ord.latitude),
-                    Number(ord.longitude)
-                );
+                const dist = await calculateDistance(prevLat, prevLng, Number(ord.latitude), Number(ord.longitude));
                 totalGroupDistance += dist;
                 const timeForThisLeg = dist * 2;
                 cumulativeTime += timeForThisLeg;
@@ -196,7 +250,7 @@ router.post("/optimize", async (req, res) => {
             const [routeResult]: any = await conn.query(insertRouteSql, [
                 rider.id,
                 jobCode,
-                group.length,
+                optimalStops.length,
                 totalGroupBoxes,
                 totalGroupDistance,
                 timeDelivery,
