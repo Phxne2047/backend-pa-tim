@@ -1,4 +1,5 @@
 import express from "express";
+import { PoolConnection } from "mysql2/promise";
 import { conn } from "../dbconnect";
 import { DeliveryRoute } from "../model/delivery-routes";
 import { SHOP_CONFIG } from "../config/shop";
@@ -177,32 +178,39 @@ router.post("/", async (req, res) => {
 });
 
 router.post("/optimize", async (req, res) => {
+    let db: PoolConnection | undefined;
+
     try {
+        db = await conn.getConnection();
+        await db.beginTransaction();
+
         const shopLat = SHOP_CONFIG.latitude;
         const shopLng = SHOP_CONFIG.longitude;
 
-        await conn.query("UPDATE orders SET status = 'pending' WHERE status = 'assigned'");
-        const [orderRows]: any = await conn.query(`
+        // A recalculation replaces the current active plan. Delivered and cancelled
+        // orders are intentionally excluded from every new calculation round.
+        const [orderRows]: any = await db.query(`
             SELECT o.id, o.customer_id, o.boxes, o.menu, o.status,
                    c.name AS customer_name, c.phone AS customer_phone, c.address, c.latitude, c.longitude
             FROM orders o
             INNER JOIN customers c ON o.customer_id = c.id
-            WHERE o.status = 'pending'
+            WHERE o.status IN ('pending', 'assigned')
             ORDER BY o.id ASC
+            FOR UPDATE
         `);
 
         const orders: any[] = orderRows;
         if (orders.length === 0) {
+            await db.rollback();
             return res.status(400).json({ error: "ไม่พบออเดอร์ที่พร้อมจัดส่งในระบบ" });
         }
 
-        const [riderRows]: any = await conn.query("SELECT * FROM riders");
+        const [riderRows]: any = await db.query("SELECT * FROM riders");
         const riders: any[] = riderRows;
         if (riders.length === 0) {
+            await db.rollback();
             return res.status(400).json({ error: "ไม่พบข้อมูลไรเดอร์ในระบบ" });
         }
-        await conn.query("DELETE FROM route_stops");
-        await conn.query("DELETE FROM delivery_routes");
 
         // สร้างพิกัดสำหรับ OSRM Table API: [ร้านค้า, ออเดอร์1, ออเดอร์2, ...]
         const coordinates = [
@@ -216,6 +224,15 @@ router.post("/optimize", async (req, res) => {
 
         // ขั้นที่ 1: จัดกลุ่มออเดอร์ (Knapsack + OSRM Distance Matrix)
         const groups = groupOrdersKnapsack(orders, matrix);
+
+        // Only replace active routes. Completed routes remain as delivery history.
+        await db.query(`
+            DELETE rs
+            FROM route_stops rs
+            INNER JOIN delivery_routes dr ON dr.id = rs.route_id
+            WHERE dr.status IN ('pending', 'delivering')
+        `);
+        await db.query("DELETE FROM delivery_routes WHERE status IN ('pending', 'delivering')");
 
         const createdRoutes: any[] = [];
         let totalAllBoxes = 0;
@@ -270,7 +287,7 @@ router.post("/optimize", async (req, res) => {
                 INSERT INTO delivery_routes (rider_id, job_code, total_orders, total_boxes, total_distance, time_delivery, delivery_peice, net_profit, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             `;
-            const [routeResult]: any = await conn.query(insertRouteSql, [
+            const [routeResult]: any = await db.query(insertRouteSql, [
                 rider.id,
                 jobCode,
                 optimalStops.length,
@@ -288,7 +305,7 @@ router.post("/optimize", async (req, res) => {
                     INSERT INTO route_stops (route_id, order_id, stop_number, distance_before, total_time, status)
                     VALUES (?, ?, ?, ?, ?, 'pending')
                 `;
-                const [stopResult]: any = await conn.query(insertStopSql, [
+                const [stopResult]: any = await db.query(insertStopSql, [
                     routeId,
                     stop.order.id,
                     stop.stop_number,
@@ -296,7 +313,7 @@ router.post("/optimize", async (req, res) => {
                     stop.total_time,
                 ]);
 
-                await conn.query("UPDATE orders SET status = 'assigned' WHERE id = ?", [stop.order.id]);
+                await db.query("UPDATE orders SET status = 'assigned' WHERE id = ?", [stop.order.id]);
 
                 const lat = Number(stop.order.latitude);
                 const lng = Number(stop.order.longitude);
@@ -363,6 +380,8 @@ router.post("/optimize", async (req, res) => {
             is_risk_late: maxDeliveryTime > 60,
         };
 
+        await db.commit();
+
         res.status(200).json({
             message: "จัดเส้นทางสำเร็จเรียบร้อยแล้ว",
             shop: {
@@ -375,8 +394,13 @@ router.post("/optimize", async (req, res) => {
             routes: createdRoutes,
         });
     } catch (error) {
+        if (db) {
+            await db.rollback();
+        }
         console.error("Error optimizing routes:", error);
         res.status(500).json({ error: "Internal server error" });
+    } finally {
+        db?.release();
     }
 });
 

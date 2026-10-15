@@ -9,24 +9,31 @@ const dbconnect_1 = require("../dbconnect");
 const shop_1 = require("../config/shop");
 exports.router = express_1.default.Router();
 const OSRM_BASE_URL = process.env.OSRM_BASE_URL || "https://router.project-osrm.org";
-//คำนวณระยะทางตามถนนจริงด้วย OSRM
-async function calculateDistance(lat1, lon1, lat2, lon2) {
-    const url = `${OSRM_BASE_URL}/route/v1/driving/${lon1},${lat1};${lon2},${lat2}?overview=false`;
+async function fetchDistanceMatrix(coordinates) {
+    const coordString = coordinates.map(c => `${c.lng},${c.lat}`).join(';');
+    const url = `${OSRM_BASE_URL}/table/v1/driving/${coordString}?annotations=distance,duration`;
     const res = await fetch(url);
     const data = await res.json();
-    if (data.code === "Ok" && data.routes?.[0]) {
-        return Number((data.routes[0].distance / 1000).toFixed(2));
+    if (data.code !== "Ok" || !data.distances || !data.durations) {
+        throw new Error(`OSRM Table API error: ${data.code || 'Unknown'}`);
     }
-    return 0;
+    //     {
+    //   distances: [
+    //     [0, 12.45],  // [ระยะทางจาก A->A, ระยะทางจาก A->B] (กม.)
+    //     [12.30, 0]   // [ระยะทางจาก B->A, ระยะทางจาก B->B] (กม.)
+    //   ],
+    //   durations: [
+    //     [0, 24.5],   // [เวลาจาก A->A, เวลาจาก A->B] (นาที)
+    //     [23.8, 0]    // [เวลาจาก B->A, เวลาจาก B->B] (นาที)
+    //   ]
+    // }
+    return {
+        distances: data.distances.map((row) => row.map((d) => Number((d / 1000).toFixed(2)))),
+        durations: data.durations.map((row) => row.map((d) => Number((d / 60).toFixed(1)))),
+    };
 }
-//คำนวณระยะทางจัดกลุ่มออเดอร์ที่อยู่ใกล้เคียงกัน
-function getApproxDistance(p1, p2) {
-    const dx = (Number(p1.latitude) - Number(p2.latitude)) * 111;
-    const dy = (Number(p1.longitude) - Number(p2.longitude)) * 111;
-    return Math.sqrt(dx * dx + dy * dy);
-}
-//จัดกลุ่มออเดอร์ด้วย Knapsack
-function groupOrdersKnapsack(orders) {
+//จัดกลุ่มออเดอร์ด้วย Knapsack + OSRM Distance Matrix
+function groupOrdersKnapsack(orders, distMatrix) {
     let unassigned = [...orders].sort((a, b) => b.boxes - a.boxes || a.id - b.id);
     const groups = [];
     while (unassigned.length > 0) {
@@ -40,7 +47,7 @@ function groupOrdersKnapsack(orders) {
             const item1 = remaining[i];
             const totalB = seed.boxes + item1.boxes;
             if (totalB <= 10) {
-                const d = getApproxDistance(seed, item1);
+                const d = distMatrix.distances[seed._matrixIdx][item1._matrixIdx];
                 if (totalB > maxBoxes || (totalB === maxBoxes && d < minDistance)) {
                     maxBoxes = totalB;
                     minDistance = d;
@@ -55,7 +62,7 @@ function groupOrdersKnapsack(orders) {
                 const item2 = remaining[j];
                 const totalB = seed.boxes + item1.boxes + item2.boxes;
                 if (totalB <= 10) {
-                    const d = getApproxDistance(seed, item1) + getApproxDistance(seed, item2) + getApproxDistance(item1, item2);
+                    const d = distMatrix.distances[seed._matrixIdx][item1._matrixIdx] + distMatrix.distances[seed._matrixIdx][item2._matrixIdx] + distMatrix.distances[item1._matrixIdx][item2._matrixIdx];
                     if (totalB > maxBoxes || (totalB === maxBoxes && d < minDistance)) {
                         maxBoxes = totalB;
                         minDistance = d;
@@ -85,7 +92,7 @@ function getPermutations(arr) {
     }
     return result;
 }
-async function findOptimalRoute(shopLat, shopLng, group) {
+function findOptimalRoute(group, distMatrix, shopIdx) {
     if (group.length <= 1)
         return group;
     const allPermutations = getPermutations(group);
@@ -93,13 +100,10 @@ async function findOptimalRoute(shopLat, shopLng, group) {
     let minTotalDist = Infinity;
     for (const perm of allPermutations) {
         let totalDist = 0;
-        let prevLat = shopLat;
-        let prevLng = shopLng;
+        let prevIdx = shopIdx;
         for (const ord of perm) {
-            const dist = await calculateDistance(prevLat, prevLng, Number(ord.latitude), Number(ord.longitude));
-            totalDist += dist;
-            prevLat = Number(ord.latitude);
-            prevLng = Number(ord.longitude);
+            totalDist += distMatrix.distances[prevIdx][ord._matrixIdx];
+            prevIdx = ord._matrixIdx;
         }
         if (totalDist < minTotalDist) {
             minTotalDist = totalDist;
@@ -144,31 +148,52 @@ exports.router.post("/", async (req, res) => {
     }
 });
 exports.router.post("/optimize", async (req, res) => {
+    let db;
     try {
+        db = await dbconnect_1.conn.getConnection();
+        await db.beginTransaction();
         const shopLat = shop_1.SHOP_CONFIG.latitude;
         const shopLng = shop_1.SHOP_CONFIG.longitude;
-        await dbconnect_1.conn.query("UPDATE orders SET status = 'pending' WHERE status = 'assigned'");
-        const [orderRows] = await dbconnect_1.conn.query(`
+        // A recalculation replaces the current active plan. Delivered and cancelled
+        // orders are intentionally excluded from every new calculation round.
+        const [orderRows] = await db.query(`
             SELECT o.id, o.customer_id, o.boxes, o.menu, o.status,
                    c.name AS customer_name, c.phone AS customer_phone, c.address, c.latitude, c.longitude
             FROM orders o
             INNER JOIN customers c ON o.customer_id = c.id
-            WHERE o.status = 'pending'
+            WHERE o.status IN ('pending', 'assigned')
             ORDER BY o.id ASC
+            FOR UPDATE
         `);
         const orders = orderRows;
         if (orders.length === 0) {
+            await db.rollback();
             return res.status(400).json({ error: "ไม่พบออเดอร์ที่พร้อมจัดส่งในระบบ" });
         }
-        const [riderRows] = await dbconnect_1.conn.query("SELECT * FROM riders");
+        const [riderRows] = await db.query("SELECT * FROM riders");
         const riders = riderRows;
         if (riders.length === 0) {
+            await db.rollback();
             return res.status(400).json({ error: "ไม่พบข้อมูลไรเดอร์ในระบบ" });
         }
-        await dbconnect_1.conn.query("DELETE FROM route_stops");
-        await dbconnect_1.conn.query("DELETE FROM delivery_routes");
-        // ขั้นที่ 1: จัดกลุ่มออเดอร์ (Knapsack)
-        const groups = groupOrdersKnapsack(orders);
+        // สร้างพิกัดสำหรับ OSRM Table API: [ร้านค้า, ออเดอร์1, ออเดอร์2, ...]
+        const coordinates = [
+            { lat: shopLat, lng: shopLng },
+            ...orders.map((o) => ({ lat: Number(o.latitude), lng: Number(o.longitude) }))
+        ];
+        const matrix = await fetchDistanceMatrix(coordinates);
+        // กำหนด index ของแต่ละออเดอร์ใน distance matrix (ร้านค้า = index 0)
+        orders.forEach((o, idx) => { o._matrixIdx = idx + 1; });
+        // ขั้นที่ 1: จัดกลุ่มออเดอร์ (Knapsack + OSRM Distance Matrix)
+        const groups = groupOrdersKnapsack(orders, matrix);
+        // Only replace active routes. Completed routes remain as delivery history.
+        await db.query(`
+            DELETE rs
+            FROM route_stops rs
+            INNER JOIN delivery_routes dr ON dr.id = rs.route_id
+            WHERE dr.status IN ('pending', 'delivering')
+        `);
+        await db.query("DELETE FROM delivery_routes WHERE status IN ('pending', 'delivering')");
         const createdRoutes = [];
         let totalAllBoxes = 0;
         let totalAllOrders = 0;
@@ -180,19 +205,18 @@ exports.router.post("/optimize", async (req, res) => {
             const rider = riders[i % riders.length];
             const jobCode = `JOB-${String(i + 1).padStart(2, "0")}`;
             // หาเส้นทางที่สั้นที่สุดในกลุ่ม (TSP: 3! = 6 รูปแบบ)
-            const optimalStops = await findOptimalRoute(shopLat, shopLng, group);
+            const optimalStops = findOptimalRoute(group, matrix, 0);
             let totalGroupBoxes = 0;
             let totalGroupDistance = 0;
             let cumulativeTime = 0;
-            let prevLat = shopLat;
-            let prevLng = shopLng;
             const stopsData = [];
             for (let j = 0; j < optimalStops.length; j++) {
                 const ord = optimalStops[j];
                 totalGroupBoxes += ord.boxes;
-                const dist = await calculateDistance(prevLat, prevLng, Number(ord.latitude), Number(ord.longitude));
+                const prevIdx = j === 0 ? 0 : optimalStops[j - 1]._matrixIdx;
+                const dist = matrix.distances[prevIdx][ord._matrixIdx];
+                const timeForThisLeg = matrix.durations[prevIdx][ord._matrixIdx];
                 totalGroupDistance += dist;
-                const timeForThisLeg = dist * 2;
                 cumulativeTime += timeForThisLeg;
                 stopsData.push({
                     order: ord,
@@ -200,18 +224,16 @@ exports.router.post("/optimize", async (req, res) => {
                     distance_before: dist,
                     total_time: Number(cumulativeTime.toFixed(1)),
                 });
-                prevLat = Number(ord.latitude);
-                prevLng = Number(ord.longitude);
             }
             totalGroupDistance = Number(totalGroupDistance.toFixed(2));
-            const timeDelivery = Number((totalGroupDistance * 2).toFixed(1));
+            const timeDelivery = Number(cumulativeTime.toFixed(1));
             const deliveryFee = Number((shop_1.SHOP_CONFIG.rider_base_fee + totalGroupDistance * shop_1.SHOP_CONFIG.rider_fee_per_km_box * totalGroupBoxes).toFixed(2));
             const netProfit = Number((totalGroupBoxes * (shop_1.SHOP_CONFIG.box_price - shop_1.SHOP_CONFIG.food_cost) - deliveryFee).toFixed(2));
             const insertRouteSql = `
                 INSERT INTO delivery_routes (rider_id, job_code, total_orders, total_boxes, total_distance, time_delivery, delivery_peice, net_profit, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             `;
-            const [routeResult] = await dbconnect_1.conn.query(insertRouteSql, [
+            const [routeResult] = await db.query(insertRouteSql, [
                 rider.id,
                 jobCode,
                 optimalStops.length,
@@ -228,14 +250,14 @@ exports.router.post("/optimize", async (req, res) => {
                     INSERT INTO route_stops (route_id, order_id, stop_number, distance_before, total_time, status)
                     VALUES (?, ?, ?, ?, ?, 'pending')
                 `;
-                const [stopResult] = await dbconnect_1.conn.query(insertStopSql, [
+                const [stopResult] = await db.query(insertStopSql, [
                     routeId,
                     stop.order.id,
                     stop.stop_number,
                     stop.distance_before,
                     stop.total_time,
                 ]);
-                await dbconnect_1.conn.query("UPDATE orders SET status = 'assigned' WHERE id = ?", [stop.order.id]);
+                await db.query("UPDATE orders SET status = 'assigned' WHERE id = ?", [stop.order.id]);
                 const lat = Number(stop.order.latitude);
                 const lng = Number(stop.order.longitude);
                 savedStops.push({
@@ -296,6 +318,7 @@ exports.router.post("/optimize", async (req, res) => {
             is_risk_loss: totalNetProfit < 0,
             is_risk_late: maxDeliveryTime > 60,
         };
+        await db.commit();
         res.status(200).json({
             message: "จัดเส้นทางสำเร็จเรียบร้อยแล้ว",
             shop: {
@@ -309,8 +332,14 @@ exports.router.post("/optimize", async (req, res) => {
         });
     }
     catch (error) {
+        if (db) {
+            await db.rollback();
+        }
         console.error("Error optimizing routes:", error);
         res.status(500).json({ error: "Internal server error" });
+    }
+    finally {
+        db?.release();
     }
 });
 exports.router.get("/all", async (req, res) => {
