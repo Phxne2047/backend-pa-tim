@@ -9,10 +9,7 @@ const dbconnect_1 = require("../dbconnect");
 const shop_1 = require("../config/shop");
 exports.router = express_1.default.Router();
 const OSRM_BASE_URL = process.env.OSRM_BASE_URL || "https://router.project-osrm.org";
-// ==========================================
-// ฟังก์ชันคำนวณระยะทางและตัวช่วยจัดเส้นทาง
-// ==========================================
-// 1. คำนวณระยะทางตามถนนจริงด้วย OSRM
+//คำนวณระยะทางตามถนนจริงด้วย OSRM
 async function calculateDistance(lat1, lon1, lat2, lon2) {
     const url = `${OSRM_BASE_URL}/route/v1/driving/${lon1},${lat1};${lon2},${lat2}?overview=false`;
     const res = await fetch(url);
@@ -22,13 +19,13 @@ async function calculateDistance(lat1, lon1, lat2, lon2) {
     }
     return 0;
 }
-// คำนวณระยะทางคร่าวๆ สำหรับช่วยจัดกลุ่มออเดอร์ที่อยู่ใกล้เคียงกัน
+//คำนวณระยะทางจัดกลุ่มออเดอร์ที่อยู่ใกล้เคียงกัน
 function getApproxDistance(p1, p2) {
     const dx = (Number(p1.latitude) - Number(p2.latitude)) * 111;
     const dy = (Number(p1.longitude) - Number(p2.longitude)) * 111;
     return Math.sqrt(dx * dx + dy * dy);
 }
-// 2. ขั้นที่ 1: จัดกลุ่มออเดอร์ด้วย Knapsack (เน้นจำนวนกล่องสูงสุด ไม่เกิน 10 กล่อง และไม่เกิน 3 จุดส่ง)
+//จัดกลุ่มออเดอร์ด้วย Knapsack
 function groupOrdersKnapsack(orders) {
     let unassigned = [...orders].sort((a, b) => b.boxes - a.boxes || a.id - b.id);
     const groups = [];
@@ -38,7 +35,7 @@ function groupOrdersKnapsack(orders) {
         let bestSubset = [];
         let maxBoxes = seed.boxes;
         let minDistance = Infinity;
-        // ทดลองเพิ่ม 1 ออเดอร์
+        //เพิ่ม 1 ออเดอร์
         for (let i = 0; i < remaining.length; i++) {
             const item1 = remaining[i];
             const totalB = seed.boxes + item1.boxes;
@@ -51,7 +48,7 @@ function groupOrdersKnapsack(orders) {
                 }
             }
         }
-        // ทดลองเพิ่ม 2 ออเดอร์ (รวม seed เป็น 3 จุดส่ง)
+        //เพิ่ม 2 ออเดอร์
         for (let i = 0; i < remaining.length; i++) {
             for (let j = i + 1; j < remaining.length; j++) {
                 const item1 = remaining[i];
@@ -74,7 +71,7 @@ function groupOrdersKnapsack(orders) {
     }
     return groups;
 }
-// 3. ขั้นที่ 2: สลับลำดับจุดส่งในกลุ่มให้สั้นที่สุด (TSP Permutations: 3! = 6 รูปแบบ)
+//สลับลำดับจุดส่งในกลุ่มให้สั้นที่สุด
 function getPermutations(arr) {
     if (arr.length <= 1)
         return [arr];
@@ -111,9 +108,6 @@ async function findOptimalRoute(shopLat, shopLng, group) {
     }
     return bestPermutation;
 }
-// ==========================================
-// REST API Endpoints
-// ==========================================
 exports.router.get("/", async (req, res) => {
     try {
         const [rows] = await dbconnect_1.conn.query("SELECT * FROM delivery_routes");

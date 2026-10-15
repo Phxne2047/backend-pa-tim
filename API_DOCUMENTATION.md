@@ -559,19 +559,37 @@
 - มอเตอร์ไซค์ 1 คัน รับได้สูงสุด **ไม่เกิน 10 กล่อง**
 - ไรเดอร์ 1 คน รับงานได้ **ไม่เกิน 3 ออเดอร์ (3 จุดส่ง)**
 - เริ่มออกส่ง 11:30 น. และต้องถึงจุดสุดท้ายก่อน 12:30 น. ($\le 60$ นาที)
-- จัดกลุ่มตามจุดส่งที่อยู่ใกล้เคียงกันที่สุด (Nearest Neighbor) เพื่อประหยัดระยะทางและน้ำมัน
-- คำนวณค่าส่ง: $15 + (\text{ระยะทางรวม} \times 2 \times \text{จำนวนกล่อง})$
-- คำนวณกำไรสุทธิ: $(\text{จำนวนกล่อง} \times 25) - \text{ค่าขนส่ง}$
 - บันทึกลงตาราง `delivery_routes` และ `route_stops` อัตโนมัติ พร้อมอัปเดตสถานะออเดอร์เป็น `assigned`
+
+> **🧠 อัลกอริทึมที่ใช้ (OSRM Table API + Knapsack + TSP)**
+>
+> **ขั้นที่ 0 — OSRM Table API (Distance Matrix)**
+> เรียก OSRM Table API ครั้งเดียวพร้อมพิกัด `[ร้านค้า, ออเดอร์1, ออเดอร์2, ...]`  
+> ได้ระยะทาง (กม.) และเวลาเดินทาง (นาที) **ตามถนนจริง** ทุกคู่จุดส่งกลับมาเป็น Matrix  
+> `GET /table/v1/driving/{coordinates}?annotations=distance,duration`
+>
+> **ขั้นที่ 1 — Knapsack Grouping (จัดกลุ่มออเดอร์)**
+> เรียงออเดอร์ตามจำนวนกล่องมากไปน้อย แล้วเลือกจับคู่/สาม  
+> ที่ได้กล่องรวมมากที่สุด (≤ 10 กล่อง) และระยะทางรวม OSRM น้อยที่สุด
+>
+> **ขั้นที่ 2 — Permutation TSP (หาลำดับส่งที่สั้นที่สุด)**
+> สลับลำดับจุดส่งในแต่ละกลุ่ม (สูงสุด 3! = 6 รูปแบบ)  
+> เปรียบเทียบระยะทางจาก Distance Matrix แล้วเลือกลำดับที่สั้นที่สุด
+>
+> **ขั้นที่ 3 — คำนวณค่าส่งและกำไร**
+> - ค่าส่ง: $15 + (\text{ระยะทางรวม} \times 2 \times \text{จำนวนกล่อง})$
+> - กำไรสุทธิ: $(\text{จำนวนกล่อง} \times 25) - \text{ค่าขนส่ง}$
+> - เวลาเดินทาง: ใช้เวลาจริงจาก OSRM (ไม่ใช่สูตรประมาณ)
 
 - **Method:** `POST`
 - **URL ตัวอย่าง:** `https://backend-pa-tim.vercel.app/delivery-routes/optimize`
 - **Request Body:** ไม่ต้องส่ง (หรือส่ง `{}` เปล่าได้)
+- **Environment Variable:** `OSRM_BASE_URL` (ค่าเริ่มต้น: `https://router.project-osrm.org`)
 
 #### Response (`200 OK`):
 ```json
 {
-  "message": "จัดเส้นทางสำเร็จ",
+  "message": "จัดเส้นทางสำเร็จเรียบร้อยแล้ว",
   "shop": {
     "name": "ร้านป้าติ๋ม ข้าวกล่องเดลิเวอรี (ส่งด่วนมื้อเที่ยง)",
     "address": "คณะวิทยาการสารสนเทศ มมส.",
@@ -584,9 +602,10 @@
     "total_riders_used": 7,
     "total_revenue": 2470,
     "total_food_cost": 1520,
+    "total_gross_profit": 950,
     "total_delivery_cost": 192.92,
     "net_profit": 757.08,
-    "max_delivery_time_min": 7.8,
+    "max_delivery_time_min": 5.3,
     "is_risk_loss": false,
     "is_risk_late": false
   },
@@ -600,9 +619,9 @@
       "route_color": "#EF4444",
       "total_orders": 3,
       "total_boxes": 7,
-      "total_distance": 3.85,
-      "time_delivery": 7.7,
-      "delivery_peice": 74.29,
+      "total_distance_km": 3.85,
+      "estimated_time_min": 5.3,
+      "delivery_fee": 74.29,
       "net_profit": 100.71,
       "status": "pending",
       "stops": [
@@ -617,15 +636,28 @@
           "menu": "ข้าวกะเพราทะเลรวมมิตร",
           "latitude": 16.2462,
           "longitude": 103.2465,
-          "distance_before": 0.6,
-          "total_time": 1.2,
-          "status": "pending",
-          "google_map_url": "https://www.google.com/maps/dir/?api=1&destination=16.2462,103.2465"
+          "distance_from_prev_km": 0.6,
+          "cumulative_time_min": 1.2,
+          "google_map_url": "https://www.google.com/maps/dir/?api=1&destination=16.2462,103.2465",
+          "status": "pending"
         }
       ]
     }
   ]
 }
+```
+
+> [!TIP]
+> - `estimated_time_min` คือ **เวลาเดินทางจริงตามถนนจาก OSRM** (หน่วย: นาที) ไม่ใช่การประมาณด้วยสูตร
+> - `distance_from_prev_km` คือระยะทางตามถนนจริง (กม.) จากจุดก่อนหน้า (จุดแรก = จากร้านค้า)
+> - `is_risk_late: true` เมื่อเวลาจัดส่งรอบที่นานที่สุดเกิน 60 นาที
+
+#### Error Response (`400 Bad Request`):
+```json
+{ "error": "ไม่พบออเดอร์ที่พร้อมจัดส่งในระบบ" }
+```
+```json
+{ "error": "ไม่พบข้อมูลไรเดอร์ในระบบ" }
 ```
 
 ---
