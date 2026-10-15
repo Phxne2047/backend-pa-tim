@@ -182,7 +182,7 @@ router.post("/optimize", async (req, res) => {
 
     try {
         db = await conn.getConnection();
-        await db.beginTransaction();
+        await db.beginTransaction(); //ขั้นตอนไหนมีข้อผิดพลาด ระบบจะทำการ rollback() เพื่อยกเลิกคำสั่งทั้งหมดก่อนหน้า ไม่ให้ข้อมูลใน Database เสียหาย
 
         const shopLat = SHOP_CONFIG.latitude;
         const shopLng = SHOP_CONFIG.longitude;
