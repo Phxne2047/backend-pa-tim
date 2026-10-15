@@ -24,6 +24,17 @@ async function fetchDistanceMatrix(coordinates: { lat: number; lng: number }[]):
         throw new Error(`OSRM Table API error: ${data.code || 'Unknown'}`);
     }
 
+    //     {
+    //   distances: [
+    //     [0, 12.45],  // [ระยะทางจาก A->A, ระยะทางจาก A->B] (กม.)
+    //     [12.30, 0]   // [ระยะทางจาก B->A, ระยะทางจาก B->B] (กม.)
+    //   ],
+    //   durations: [
+    //     [0, 24.5],   // [เวลาจาก A->A, เวลาจาก A->B] (นาที)
+    //     [23.8, 0]    // [เวลาจาก B->A, เวลาจาก B->B] (นาที)
+    //   ]
+    // }
+
     return {
         distances: data.distances.map((row: number[]) =>
             row.map((d: number) => Number((d / 1000).toFixed(2)))
