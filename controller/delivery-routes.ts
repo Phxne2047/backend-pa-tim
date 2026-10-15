@@ -4,12 +4,22 @@ import { DeliveryRoute } from "../model/delivery-routes";
 import { SHOP_CONFIG } from "../config/shop";
 
 export const router = express.Router();
+const OSRM_BASE_URL = process.env.OSRM_BASE_URL || "https://router.project-osrm.org";
 
-function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+async function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): Promise<number> {
+    try {
+        const url = `${OSRM_BASE_URL}/route/v1/driving/${lon1},${lat1};${lon2},${lat2}?overview=false`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+        const data: any = await res.json();
+        if (data.code === "Ok" && data.routes?.[0]) {
+            return Number((data.routes[0].distance / 1000).toFixed(2));
+        }
+    } catch (e) {
+        // หาก OSRM มีปัญหาหรือเน็ตหลุด ให้ Fallback กลับมาใช้สูตรเส้นตรงอัตโนมัติ
+    }
     const x = (lat1 - lat2) * 111;
     const y = (lon1 - lon2) * 111;
-    const distance = Math.sqrt(x * x + y * y);
-    return Number(distance.toFixed(2));
+    return Number(Math.sqrt(x * x + y * y).toFixed(2));
 }
 
 router.get("/", async (req, res) => {
@@ -77,7 +87,6 @@ router.post("/optimize", async (req, res) => {
         await conn.query("DELETE FROM route_stops");
         await conn.query("DELETE FROM delivery_routes");
 
-
         let unassigned = [...orders];
         const groups: any[][] = [];
 
@@ -99,7 +108,7 @@ router.post("/optimize", async (req, res) => {
                 for (let i = 0; i < unassigned.length; i++) {
                     const candidate = unassigned[i];
                     if (currentBoxes + candidate.boxes <= 10) {
-                        const dist = calculateDistance(
+                        const dist = await calculateDistance(
                             Number(lastPoint.latitude),
                             Number(lastPoint.longitude),
                             Number(candidate.latitude),
@@ -148,7 +157,7 @@ router.post("/optimize", async (req, res) => {
                 const ord = group[j]!;
                 totalGroupBoxes += ord.boxes;
 
-                const dist = calculateDistance(
+                const dist = await calculateDistance(
                     prevLat,
                     prevLng,
                     Number(ord.latitude),

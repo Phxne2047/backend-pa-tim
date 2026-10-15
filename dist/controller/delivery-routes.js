@@ -8,11 +8,24 @@ const express_1 = __importDefault(require("express"));
 const dbconnect_1 = require("../dbconnect");
 const shop_1 = require("../config/shop");
 exports.router = express_1.default.Router();
-function calculateDistance(lat1, lon1, lat2, lon2) {
+const OSRM_BASE_URL = process.env.OSRM_BASE_URL || "https://router.project-osrm.org";
+// คำนวณระยะทางตามถนนจริงด้วย OSRM Route API (แบบง่ายที่สุด)
+async function calculateDistance(lat1, lon1, lat2, lon2) {
+    try {
+        // ⚠️ OSRM ใช้พิกัด {lon},{lat}
+        const url = `${OSRM_BASE_URL}/route/v1/driving/${lon1},${lat1};${lon2},${lat2}?overview=false`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+        const data = await res.json();
+        if (data.code === "Ok" && data.routes?.[0]) {
+            return Number((data.routes[0].distance / 1000).toFixed(2)); // แปลงเมตรเป็นกิโลเมตร
+        }
+    }
+    catch (e) {
+        // หาก OSRM มีปัญหาหรือเน็ตหลุด ให้ Fallback กลับมาใช้สูตรเส้นตรงอัตโนมัติ
+    }
     const x = (lat1 - lat2) * 111;
     const y = (lon1 - lon2) * 111;
-    const distance = Math.sqrt(x * x + y * y);
-    return Number(distance.toFixed(2));
+    return Number(Math.sqrt(x * x + y * y).toFixed(2));
 }
 exports.router.get("/", async (req, res) => {
     try {
@@ -90,7 +103,7 @@ exports.router.post("/optimize", async (req, res) => {
                 for (let i = 0; i < unassigned.length; i++) {
                     const candidate = unassigned[i];
                     if (currentBoxes + candidate.boxes <= 10) {
-                        const dist = calculateDistance(Number(lastPoint.latitude), Number(lastPoint.longitude), Number(candidate.latitude), Number(candidate.longitude));
+                        const dist = await calculateDistance(Number(lastPoint.latitude), Number(lastPoint.longitude), Number(candidate.latitude), Number(candidate.longitude));
                         if (dist < minDistance) {
                             minDistance = dist;
                             bestIndex = i;
@@ -127,7 +140,7 @@ exports.router.post("/optimize", async (req, res) => {
             for (let j = 0; j < group.length; j++) {
                 const ord = group[j];
                 totalGroupBoxes += ord.boxes;
-                const dist = calculateDistance(prevLat, prevLng, Number(ord.latitude), Number(ord.longitude));
+                const dist = await calculateDistance(prevLat, prevLng, Number(ord.latitude), Number(ord.longitude));
                 totalGroupDistance += dist;
                 const timeForThisLeg = dist * 2;
                 cumulativeTime += timeForThisLeg;
