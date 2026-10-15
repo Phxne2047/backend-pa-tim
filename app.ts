@@ -1,6 +1,8 @@
 import express from "express";
 import { router as customers } from "./controller/customers";
 import { router as orders } from "./controller/orders";
+import { router as riders } from "./controller/riders";
+import { router as deliveryRoutes } from "./controller/delivery-routes";
 import cors from "cors";
 
 export const app = express();
@@ -45,5 +47,6 @@ app.use(express.json());
 
 app.use("/customers", customers);
 app.use("/orders", orders);
-
+app.use("/riders", riders);
+app.use("/delivery-routes", deliveryRoutes);
 export default app;
