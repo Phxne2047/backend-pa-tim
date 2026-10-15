@@ -159,6 +159,11 @@ router.post("/mock", async (req, res) => {
 router.post("/", async (req, res) => {
     try {
         let order: OrdersPostRequests = req.body;
+
+        if (order.boxes > 3) {
+            return res.status(400).json({ error: "An order cannot contain more than 3 boxes" });
+        }
+
         let sql =
             "INSERT INTO `orders`(`customer_id`, `boxes`, `status`, `menu`) VALUES (?,?,?,?)";
 
@@ -304,4 +309,3 @@ router.patch("/:id", async (req, res) => {
         res.status(500).json({ error: error instanceof Error ? error.message : "Internal server error" });
     }
 });
-
