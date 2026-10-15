@@ -187,8 +187,6 @@ router.post("/optimize", async (req, res) => {
         const shopLat = SHOP_CONFIG.latitude;
         const shopLng = SHOP_CONFIG.longitude;
 
-        // A recalculation replaces the current active plan. Delivered and cancelled
-        // orders are intentionally excluded from every new calculation round.
         const [orderRows]: any = await db.query(`
             SELECT o.id, o.customer_id, o.boxes, o.menu, o.status,
                    c.name AS customer_name, c.phone AS customer_phone, c.address, c.latitude, c.longitude
@@ -224,8 +222,6 @@ router.post("/optimize", async (req, res) => {
 
         // ขั้นที่ 1: จัดกลุ่มออเดอร์ (Knapsack + OSRM Distance Matrix)
         const groups = groupOrdersKnapsack(orders, matrix);
-
-        // Only replace active routes. Completed routes remain as delivery history.
         await db.query(`
             DELETE rs
             FROM route_stops rs
