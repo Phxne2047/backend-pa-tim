@@ -588,6 +588,13 @@
 - **URL ตัวอย่าง:** `https://backend-pa-tim.vercel.app/delivery-routes/optimize`
 - **Request Body:** ไม่ต้องส่ง (หรือส่ง `{}` เปล่าได้)
 - **Environment Variable:** `OSRM_BASE_URL` (ค่าเริ่มต้น: `https://router.project-osrm.org`)
+- **Timeout:** ใช้เวลาโดยรวมสูงสุด 30 วินาที และรอ OSRM สูงสุด 15 วินาที
+  - ปรับได้ด้วย `OPTIMIZE_TIMEOUT_MS` และ `OSRM_TIMEOUT_MS` (หน่วยมิลลิวินาที)
+
+#### Error Responses
+- `400 Bad Request`: ไม่มีออเดอร์ที่พร้อมจัดส่ง หรือไม่มีไรเดอร์
+- `504 Gateway Timeout`: OSRM หรือการคำนวณเส้นทางใช้เวลานานเกินกำหนด
+- `500 Internal Server Error`: เกิดข้อผิดพลาดในการคำนวณหรือบันทึกข้อมูล
 
 #### Response (`200 OK`):
 ```json

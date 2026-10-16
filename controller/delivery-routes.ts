@@ -6,6 +6,22 @@ import { SHOP_CONFIG } from "../config/shop";
 
 export const router = express.Router();
 const OSRM_BASE_URL = process.env.OSRM_BASE_URL || "https://router.project-osrm.org";
+const getPositiveTimeout = (value: string | undefined, fallback: number): number => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+const OPTIMIZE_TIMEOUT_MS = getPositiveTimeout(process.env.OPTIMIZE_TIMEOUT_MS, 30_000);
+const OSRM_TIMEOUT_MS = Math.min(
+    getPositiveTimeout(process.env.OSRM_TIMEOUT_MS, 15_000),
+    OPTIMIZE_TIMEOUT_MS
+);
+
+class OptimizationTimeoutError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "OptimizationTimeoutError";
+    }
+}
 
 
 // OSRM Table API: ดึง Distance Matrix ระยะทาง+เวลาจริงตามถนนทุกคู่จุดในครั้งเดียว
@@ -14,36 +30,53 @@ interface DistanceMatrix {
     durations: number[][]; // เวลาเดินทาง (นาที)
 }
 
-async function fetchDistanceMatrix(coordinates: { lat: number; lng: number }[]): Promise<DistanceMatrix> {
+async function fetchDistanceMatrix(
+    coordinates: { lat: number; lng: number }[],
+    timeoutMs: number
+): Promise<DistanceMatrix> {
     const coordString = coordinates.map(c => `${c.lng},${c.lat}`).join(';');
     const url = `${OSRM_BASE_URL}/table/v1/driving/${coordString}?annotations=distance,duration`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    const res = await fetch(url);
-    const data: any = await res.json();
+    try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) {
+            throw new Error(`OSRM Table API returned HTTP ${res.status}`);
+        }
+        const data: any = await res.json();
 
-    if (data.code !== "Ok" || !data.distances || !data.durations) {
-        throw new Error(`OSRM Table API error: ${data.code || 'Unknown'}`);
+        if (data.code !== "Ok" || !data.distances || !data.durations) {
+            throw new Error(`OSRM Table API error: ${data.code || 'Unknown'}`);
+        }
+
+        //     {
+        //   distances: [
+        //     [0, 12.45],  // [ระยะทางจาก A->A, ระยะทางจาก A->B] (กม.)
+        //     [12.30, 0]   // [ระยะทางจาก B->A, ระยะทางจาก B->B] (กม.)
+        //   ],
+        //   durations: [
+        //     [0, 24.5],   // [เวลาจาก A->A, เวลาจาก A->B] (นาที)
+        //     [23.8, 0]    // [เวลาจาก B->A, เวลาจาก B->B] (นาที)
+        //   ]
+        // }
+
+        return {
+            distances: data.distances.map((row: number[]) =>
+                row.map((d: number) => Number((d / 1000).toFixed(2)))
+            ),
+            durations: data.durations.map((row: number[]) =>
+                row.map((d: number) => Number((d / 60).toFixed(1)))
+            ),
+        };
+    } catch (error) {
+        if (controller.signal.aborted) {
+            throw new OptimizationTimeoutError("OSRM route calculation timed out");
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeout);
     }
-
-    //     {
-    //   distances: [
-    //     [0, 12.45],  // [ระยะทางจาก A->A, ระยะทางจาก A->B] (กม.)
-    //     [12.30, 0]   // [ระยะทางจาก B->A, ระยะทางจาก B->B] (กม.)
-    //   ],
-    //   durations: [
-    //     [0, 24.5],   // [เวลาจาก A->A, เวลาจาก A->B] (นาที)
-    //     [23.8, 0]    // [เวลาจาก B->A, เวลาจาก B->B] (นาที)
-    //   ]
-    // }
-
-    return {
-        distances: data.distances.map((row: number[]) =>
-            row.map((d: number) => Number((d / 1000).toFixed(2)))
-        ),
-        durations: data.durations.map((row: number[]) =>
-            row.map((d: number) => Number((d / 60).toFixed(1)))
-        ),
-    };
 }
 
 //จัดกลุ่มออเดอร์ด้วย Knapsack + OSRM Distance Matrix
@@ -179,10 +212,25 @@ router.post("/", async (req, res) => {
 
 router.post("/optimize", async (req, res) => {
     let db: PoolConnection | undefined;
+    let transactionStarted = false;
+    const deadline = Date.now() + OPTIMIZE_TIMEOUT_MS;
+    const ensureWithinDeadline = () => {
+        if (Date.now() >= deadline || res.headersSent) {
+            throw new OptimizationTimeoutError("Route optimization timed out");
+        }
+    };
 
     try {
+        res.setTimeout(OPTIMIZE_TIMEOUT_MS, () => {
+            if (!res.headersSent) {
+                res.status(504).json({ error: "Route optimization timed out" });
+            }
+        });
+
         db = await conn.getConnection();
         await db.beginTransaction(); //ขั้นตอนไหนมีข้อผิดพลาด ระบบจะทำการ rollback() เพื่อยกเลิกคำสั่งทั้งหมดก่อนหน้า ไม่ให้ข้อมูลใน Database เสียหาย
+        transactionStarted = true;
+        ensureWithinDeadline();
 
         const shopLat = SHOP_CONFIG.latitude;
         const shopLng = SHOP_CONFIG.longitude;
@@ -196,6 +244,7 @@ router.post("/optimize", async (req, res) => {
             ORDER BY o.id ASC
             FOR UPDATE
         `);
+        ensureWithinDeadline();
 
         const orders: any[] = orderRows;
         if (orders.length === 0) {
@@ -204,6 +253,7 @@ router.post("/optimize", async (req, res) => {
         }
 
         const [riderRows]: any = await db.query("SELECT * FROM riders");
+        ensureWithinDeadline();
         const riders: any[] = riderRows;
         if (riders.length === 0) {
             await db.rollback();
@@ -215,7 +265,11 @@ router.post("/optimize", async (req, res) => {
             { lat: shopLat, lng: shopLng },
             ...orders.map((o: any) => ({ lat: Number(o.latitude), lng: Number(o.longitude) }))
         ];
-        const matrix = await fetchDistanceMatrix(coordinates);
+        const matrix = await fetchDistanceMatrix(
+            coordinates,
+            Math.max(1, Math.min(OSRM_TIMEOUT_MS, deadline - Date.now()))
+        );
+        ensureWithinDeadline();
 
         // กำหนด index ของแต่ละออเดอร์ใน distance matrix (ร้านค้า = index 0)
         orders.forEach((o: any, idx: number) => { o._matrixIdx = idx + 1; });
@@ -229,6 +283,7 @@ router.post("/optimize", async (req, res) => {
             WHERE dr.status IN ('pending', 'delivering')
         `);
         await db.query("DELETE FROM delivery_routes WHERE status IN ('pending', 'delivering')");
+        ensureWithinDeadline();
 
         const createdRoutes: any[] = [];
         let totalAllBoxes = 0;
@@ -238,6 +293,7 @@ router.post("/optimize", async (req, res) => {
 
         // ขั้นที่ 2: วิ่งหาลำดับส่งที่ดีที่สุดสำหรับแต่ละกลุ่ม และสร้างเส้นทาง
         for (let i = 0; i < groups.length; i++) {
+            ensureWithinDeadline();
             const group = groups[i]!;
             const rider = riders[i % riders.length]!;
             const jobCode = `JOB-${String(i + 1).padStart(2, "0")}`;
@@ -293,10 +349,12 @@ router.post("/optimize", async (req, res) => {
                 deliveryFee,
                 netProfit,
             ]);
+            ensureWithinDeadline();
             const routeId = routeResult.insertId;
 
             const savedStops: any[] = [];
             for (const stop of stopsData) {
+                ensureWithinDeadline();
                 const insertStopSql = `
                     INSERT INTO route_stops (route_id, order_id, stop_number, distance_before, total_time, status)
                     VALUES (?, ?, ?, ?, ?, 'pending')
@@ -376,7 +434,9 @@ router.post("/optimize", async (req, res) => {
             is_risk_late: maxDeliveryTime > 60,
         };
 
+        ensureWithinDeadline();
         await db.commit();
+        transactionStarted = false;
 
         res.status(200).json({
             message: "จัดเส้นทางสำเร็จเรียบร้อยแล้ว",
@@ -390,11 +450,21 @@ router.post("/optimize", async (req, res) => {
             routes: createdRoutes,
         });
     } catch (error) {
-        if (db) {
-            await db.rollback();
+        if (db && transactionStarted) {
+            try {
+                await db.rollback();
+            } catch (rollbackError) {
+                console.error("Error rolling back route optimization:", rollbackError);
+            }
         }
         console.error("Error optimizing routes:", error);
-        res.status(500).json({ error: "Internal server error" });
+        if (!res.headersSent) {
+            if (error instanceof OptimizationTimeoutError) {
+                res.status(504).json({ error: error.message });
+            } else {
+                res.status(500).json({ error: "Internal server error" });
+            }
+        }
     } finally {
         db?.release();
     }
