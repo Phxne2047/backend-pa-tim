@@ -32,6 +32,7 @@ const MENUS = [
     "ข้าวพริกแกงหมูใส่ถั่ว",
 ];
 
+//use
 router.get("/", async (req, res) => {
     const shopLat = SHOP_CONFIG.latitude
     const shopLng = SHOP_CONFIG.longitude
@@ -88,6 +89,7 @@ router.get("/:id", async (req, res) => {
     }
 });
 
+//mock
 router.post("/mock", async (req, res) => {
     try {
         let body: OrderMockRequests = req.body || {};
@@ -156,6 +158,7 @@ router.post("/mock", async (req, res) => {
     }
 });
 
+//use
 router.post("/", async (req, res) => {
     try {
         let order: OrdersPostRequests = req.body;
@@ -201,6 +204,7 @@ router.delete("/all", async (req, res) => {
     }
 });
 
+//use
 router.delete("/:id", async (req, res) => {
     try {
         let id = req.params.id
@@ -262,6 +266,7 @@ router.put("/:id", async (req, res) => {
 });
 
 
+//use
 router.patch("/:id", async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
