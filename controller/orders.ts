@@ -110,6 +110,7 @@ router.post("/mock", async (req, res) => {
 
             // ใช้ TRUNCATE เพื่อลบข้อมูลและรีเซ็ต ID เริ่มต้นที่ 1 ใหม่
             await conn.query("TRUNCATE TABLE route_stops;");
+            await conn.query("TRUNCATE TABLE delivery_routes;");
             await conn.query("TRUNCATE TABLE orders;");
 
             // เปิดการตรวจสอบ Foreign Key กลับมา

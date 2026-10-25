@@ -450,7 +450,19 @@ router.get("/all", async (req, res) => {
                     latitude: SHOP_CONFIG.latitude,
                     longitude: SHOP_CONFIG.longitude,
                 },
-                financial_dashboard: null,
+                financial_dashboard: {
+                    total_orders: 0,
+                    total_boxes: 0,
+                    total_riders_used: 0,
+                    total_revenue: 0,
+                    total_food_cost: 0,
+                    total_gross_profit: 0,
+                    total_delivery_cost: 0,
+                    net_profit: 0,
+                    max_delivery_time_min: 0,
+                    is_risk_loss: false,
+                    is_risk_late: false,
+                },
                 routes: [],
             });
         }
