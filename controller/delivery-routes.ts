@@ -182,7 +182,9 @@ router.post("/optimize", async (req, res) => {
 
     try {
         db = await conn.getConnection();
-        await db.beginTransaction(); //ขั้นตอนไหนมีข้อผิดพลาด ระบบจะทำการ rollback() เพื่อยกเลิกคำสั่งทั้งหมดก่อนหน้า ไม่ให้ข้อมูลใน Database เสียหาย
+        await db.beginTransaction(); // Begin transaction; will rollback on error to protect DB integrity.
+        // Reset order statuses to pending before re-optimizing to allow repeated calculations.
+        await db.query("UPDATE orders SET status = 'pending' WHERE status = 'assigned'");
 
         const shopLat = SHOP_CONFIG.latitude;
         const shopLng = SHOP_CONFIG.longitude;
@@ -222,13 +224,13 @@ router.post("/optimize", async (req, res) => {
 
         // ขั้นที่ 1: จัดกลุ่มออเดอร์ (Knapsack + OSRM Distance Matrix)
         const groups = groupOrdersKnapsack(orders, matrix);
+        // Remove all existing route stops and delivery routes regardless of status to ensure a clean slate.
         await db.query(`
             DELETE rs
             FROM route_stops rs
             INNER JOIN delivery_routes dr ON dr.id = rs.route_id
-            WHERE dr.status IN ('pending', 'delivering')
         `);
-        await db.query("DELETE FROM delivery_routes WHERE status IN ('pending', 'delivering')");
+        await db.query("DELETE FROM delivery_routes");
 
         const createdRoutes: any[] = [];
         let totalAllBoxes = 0;
