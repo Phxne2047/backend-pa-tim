@@ -14,7 +14,6 @@ interface DistanceMatrix {
     durations: number[][]; // เวลาเดินทาง (นาที)
 }
 
-// In-memory cache for distance matrices based on coordinates to make repeated re-calculations instant (<50ms)
 const matrixCache = new Map<string, DistanceMatrix>();
 
 function calculateHaversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
@@ -24,11 +23,10 @@ function calculateHaversineDistance(lat1: number, lon1: number, lat2: number, lo
     const a =
         Math.sin(dLat / 2) * Math.sin(dLat / 2) +
         Math.cos((lat1 * Math.PI) / 180) *
-            Math.cos((lat2 * Math.PI) / 180) *
-            Math.sin(dLon / 2) *
-            Math.sin(dLon / 2);
+        Math.cos((lat2 * Math.PI) / 180) *
+        Math.sin(dLon / 2) *
+        Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    // 1.35 factor to approximate real road winding distance
     return Number((R * c * 1.35).toFixed(2));
 }
 
@@ -36,7 +34,6 @@ function generateFallbackMatrix(coordinates: { lat: number; lng: number }[]): Di
     const n = coordinates.length;
     const distances: number[][] = [];
     const durations: number[][] = [];
-    // Average speed 30 km/h -> 2 minutes per 1 km
     for (let i = 0; i < n; i++) {
         distances[i] = [];
         durations[i] = [];
@@ -62,7 +59,6 @@ function generateFallbackMatrix(coordinates: { lat: number; lng: number }[]): Di
 async function fetchDistanceMatrix(coordinates: { lat: number; lng: number }[]): Promise<DistanceMatrix> {
     const coordKey = coordinates.map((c) => `${c.lng.toFixed(5)},${c.lat.toFixed(5)}`).join(";");
 
-    // Check memory cache first - enables rapid repeat calculations without hitting OSRM rate limits
     if (matrixCache.has(coordKey)) {
         return matrixCache.get(coordKey)!;
     }
@@ -72,7 +68,7 @@ async function fetchDistanceMatrix(coordinates: { lat: number; lng: number }[]):
 
     try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 6000); // 6s timeout to prevent hanging
+        const timeoutId = setTimeout(() => controller.abort(), 6000);
 
         const res = await fetch(url, { signal: controller.signal });
         clearTimeout(timeoutId);
