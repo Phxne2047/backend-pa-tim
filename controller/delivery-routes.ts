@@ -305,6 +305,7 @@ router.post("/optimize", async (req, res) => {
         let totalAllOrders = 0;
         let totalAllDeliveryCost = 0;
         let maxDeliveryTime = 0;
+        const allAssignedOrderIds: number[] = [];
 
         // ขั้นที่ 2: วิ่งหาลำดับส่งที่ดีที่สุดสำหรับแต่ละกลุ่ม และสร้างเส้นทาง
         for (let i = 0; i < groups.length; i++) {

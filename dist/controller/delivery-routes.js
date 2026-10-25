@@ -9,7 +9,6 @@ const dbconnect_1 = require("../dbconnect");
 const shop_1 = require("../config/shop");
 exports.router = express_1.default.Router();
 const OSRM_BASE_URL = process.env.OSRM_BASE_URL || "https://router.project-osrm.org";
-// In-memory cache for distance matrices based on coordinates to make repeated re-calculations instant (<50ms)
 const matrixCache = new Map();
 function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
     const R = 6371; // Earth radius in km
@@ -21,14 +20,12 @@ function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
             Math.sin(dLon / 2) *
             Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    // 1.35 factor to approximate real road winding distance
     return Number((R * c * 1.35).toFixed(2));
 }
 function generateFallbackMatrix(coordinates) {
     const n = coordinates.length;
     const distances = [];
     const durations = [];
-    // Average speed 30 km/h -> 2 minutes per 1 km
     for (let i = 0; i < n; i++) {
         distances[i] = [];
         durations[i] = [];
@@ -48,7 +45,6 @@ function generateFallbackMatrix(coordinates) {
 }
 async function fetchDistanceMatrix(coordinates) {
     const coordKey = coordinates.map((c) => `${c.lng.toFixed(5)},${c.lat.toFixed(5)}`).join(";");
-    // Check memory cache first - enables rapid repeat calculations without hitting OSRM rate limits
     if (matrixCache.has(coordKey)) {
         return matrixCache.get(coordKey);
     }
@@ -56,7 +52,7 @@ async function fetchDistanceMatrix(coordinates) {
     const url = `${OSRM_BASE_URL}/table/v1/driving/${coordString}?annotations=distance,duration`;
     try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 6000); // 6s timeout to prevent hanging
+        const timeoutId = setTimeout(() => controller.abort(), 6000);
         const res = await fetch(url, { signal: controller.signal });
         clearTimeout(timeoutId);
         const data = await res.json();
@@ -254,6 +250,7 @@ exports.router.post("/optimize", async (req, res) => {
         let totalAllOrders = 0;
         let totalAllDeliveryCost = 0;
         let maxDeliveryTime = 0;
+        const allAssignedOrderIds = [];
         // ขั้นที่ 2: วิ่งหาลำดับส่งที่ดีที่สุดสำหรับแต่ละกลุ่ม และสร้างเส้นทาง
         for (let i = 0; i < groups.length; i++) {
             const group = groups[i];
