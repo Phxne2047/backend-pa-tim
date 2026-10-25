@@ -14,83 +14,152 @@ interface DistanceMatrix {
     durations: number[][]; // เวลาเดินทาง (นาที)
 }
 
-async function fetchDistanceMatrix(coordinates: { lat: number; lng: number }[]): Promise<DistanceMatrix> {
-    const coordString = coordinates.map(c => `${c.lng},${c.lat}`).join(';');
-    const url = `${OSRM_BASE_URL}/table/v1/driving/${coordString}?annotations=distance,duration`;
+// In-memory cache for distance matrices based on coordinates to make repeated re-calculations instant (<50ms)
+const matrixCache = new Map<string, DistanceMatrix>();
 
-    const res = await fetch(url);
-    const data: any = await res.json();
-
-    if (data.code !== "Ok" || !data.distances || !data.durations) {
-        throw new Error(`OSRM Table API error: ${data.code || 'Unknown'}`);
-    }
-
-    //     {
-    //   distances: [
-    //     [0, 12.45],  // [ระยะทางจาก A->A, ระยะทางจาก A->B] (กม.)
-    //     [12.30, 0]   // [ระยะทางจาก B->A, ระยะทางจาก B->B] (กม.)
-    //   ],
-    //   durations: [
-    //     [0, 24.5],   // [เวลาจาก A->A, เวลาจาก A->B] (นาที)
-    //     [23.8, 0]    // [เวลาจาก B->A, เวลาจาก B->B] (นาที)
-    //   ]
-    // }
-
-    return {
-        distances: data.distances.map((row: number[]) =>
-            row.map((d: number) => Number((d / 1000).toFixed(2)))
-        ),
-        durations: data.durations.map((row: number[]) =>
-            row.map((d: number) => Number((d / 60).toFixed(1)))
-        ),
-    };
+function calculateHaversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371; // Earth radius in km
+    const dLat = ((lat2 - lat1) * Math.PI) / 180;
+    const dLon = ((lon2 - lon1) * Math.PI) / 180;
+    const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos((lat1 * Math.PI) / 180) *
+            Math.cos((lat2 * Math.PI) / 180) *
+            Math.sin(dLon / 2) *
+            Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    // 1.35 factor to approximate real road winding distance
+    return Number((R * c * 1.35).toFixed(2));
 }
 
-//จัดกลุ่มออเดอร์ด้วย Knapsack + OSRM Distance Matrix
+function generateFallbackMatrix(coordinates: { lat: number; lng: number }[]): DistanceMatrix {
+    const n = coordinates.length;
+    const distances: number[][] = [];
+    const durations: number[][] = [];
+    // Average speed 30 km/h -> 2 minutes per 1 km
+    for (let i = 0; i < n; i++) {
+        distances[i] = [];
+        durations[i] = [];
+        for (let j = 0; j < n; j++) {
+            if (i === j) {
+                distances[i]![j] = 0;
+                durations[i]![j] = 0;
+            } else {
+                const dist = calculateHaversineDistance(
+                    coordinates[i]!.lat,
+                    coordinates[i]!.lng,
+                    coordinates[j]!.lat,
+                    coordinates[j]!.lng
+                );
+                distances[i]![j] = dist;
+                durations[i]![j] = Number((dist * 2).toFixed(1));
+            }
+        }
+    }
+    return { distances, durations };
+}
+
+async function fetchDistanceMatrix(coordinates: { lat: number; lng: number }[]): Promise<DistanceMatrix> {
+    const coordKey = coordinates.map((c) => `${c.lng.toFixed(5)},${c.lat.toFixed(5)}`).join(";");
+
+    // Check memory cache first - enables rapid repeat calculations without hitting OSRM rate limits
+    if (matrixCache.has(coordKey)) {
+        return matrixCache.get(coordKey)!;
+    }
+
+    const coordString = coordinates.map((c) => `${c.lng},${c.lat}`).join(";");
+    const url = `${OSRM_BASE_URL}/table/v1/driving/${coordString}?annotations=distance,duration`;
+
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 6000); // 6s timeout to prevent hanging
+
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+
+        const data: any = await res.json();
+        if (data.code === "Ok" && data.distances && data.durations) {
+            const matrix: DistanceMatrix = {
+                distances: data.distances.map((row: number[]) =>
+                    row.map((d: number) => Number((d / 1000).toFixed(2)))
+                ),
+                durations: data.durations.map((row: number[]) =>
+                    row.map((d: number) => Number((d / 60).toFixed(1)))
+                ),
+            };
+            matrixCache.set(coordKey, matrix);
+            return matrix;
+        }
+    } catch (err) {
+        console.warn("OSRM table request failed or timed out, using road estimate fallback:", err);
+    }
+
+    const fallback = generateFallbackMatrix(coordinates);
+    matrixCache.set(coordKey, fallback);
+    return fallback;
+}
+
+//จัดกลุ่มออเดอร์ด้วย Knapsack + OSRM Distance Matrix พร้อมรองรับการสร้างทางเลือกใหม่ๆ เมื่อกดคำนวณซ้ำ
 function groupOrdersKnapsack(orders: any[], distMatrix: DistanceMatrix): any[][] {
-    let unassigned = [...orders].sort((a, b) => b.boxes - a.boxes || a.id - b.id);
+    // สุ่มจัดลำดับออเดอร์ที่มีกล่องเท่ากัน เพื่อเปิดโอกาสให้ระบบสร้างทางเลือกใหม่ๆ ทุกครั้งที่กดคำนวณใหม่
+    let unassigned = [...orders].sort((a, b) => {
+        if (b.boxes !== a.boxes) {
+            return b.boxes - a.boxes;
+        }
+        return Math.random() - 0.5;
+    });
+
     const groups: any[][] = [];
 
     while (unassigned.length > 0) {
-        const seed = unassigned[0]!;
-        const remaining = unassigned.slice(1);
+        // สุ่มเลือก seed จาก 2 ออเดอร์แรกที่มีขนาดกล่องใหญ่ เพื่อกระจายทางเลือก
+        const seedIdx = Math.min(Math.floor(Math.random() * 2), unassigned.length - 1);
+        const seed = unassigned[seedIdx]!;
+        const remaining = unassigned.filter((_, idx) => idx !== seedIdx);
 
-        let bestSubset: any[] = [];
-        let maxBoxes = seed.boxes;
-        let minDistance = Infinity;
+        const candidates: { subset: any[]; totalB: number; dist: number }[] = [];
 
-        //เพิ่ม 1 ออเดอร์
+        // ทางเลือก: ส่งเดี่ยว 1 ออเดอร์
+        candidates.push({ subset: [], totalB: seed.boxes, dist: 0 });
+
+        // เพิ่ม 1 ออเดอร์ (รวมเป็น 2 ออเดอร์)
         for (let i = 0; i < remaining.length; i++) {
             const item1 = remaining[i]!;
             const totalB = seed.boxes + item1.boxes;
             if (totalB <= 10) {
                 const d = distMatrix.distances[seed._matrixIdx]![item1._matrixIdx]!;
-                if (totalB > maxBoxes || (totalB === maxBoxes && d < minDistance)) {
-                    maxBoxes = totalB;
-                    minDistance = d;
-                    bestSubset = [item1];
-                }
+                candidates.push({ subset: [item1], totalB, dist: d });
             }
         }
 
-        //เพิ่ม 2 ออเดอร์
+        // เพิ่ม 2 ออเดอร์ (รวมเป็น 3 ออเดอร์ สูงสุดตามกฎไรเดอร์รับไม่เกิน 3 ออเดอร์)
         for (let i = 0; i < remaining.length; i++) {
             for (let j = i + 1; j < remaining.length; j++) {
                 const item1 = remaining[i]!;
                 const item2 = remaining[j]!;
                 const totalB = seed.boxes + item1.boxes + item2.boxes;
                 if (totalB <= 10) {
-                    const d = distMatrix.distances[seed._matrixIdx]![item1._matrixIdx]! + distMatrix.distances[seed._matrixIdx]![item2._matrixIdx]! + distMatrix.distances[item1._matrixIdx]![item2._matrixIdx]!;
-                    if (totalB > maxBoxes || (totalB === maxBoxes && d < minDistance)) {
-                        maxBoxes = totalB;
-                        minDistance = d;
-                        bestSubset = [item1, item2];
-                    }
+                    const d =
+                        distMatrix.distances[seed._matrixIdx]![item1._matrixIdx]! +
+                        distMatrix.distances[seed._matrixIdx]![item2._matrixIdx]! +
+                        distMatrix.distances[item1._matrixIdx]![item2._matrixIdx]!;
+                    candidates.push({ subset: [item1, item2], totalB, dist: d });
                 }
             }
         }
 
-        const currentGroup = [seed, ...bestSubset];
+        // เรียงลำดับ candidates:
+        // 1. บรรจุกล่องได้มากที่สุดก่อน (Knapsack)
+        // 2. ระยะทางรวมสั้นที่สุด
+        candidates.sort((a, b) => b.totalB - a.totalB || a.dist - b.dist);
+
+        // คัดกรองตัวเลือกที่มีกล่องสูงสุด และเลือกจาก top 2 ตัวเลือกที่ดีที่สุดแบบ stochastic
+        const maxBoxes = candidates[0]!.totalB;
+        const topCandidates = candidates.filter((c) => c.totalB === maxBoxes);
+        const bestChoices = topCandidates.slice(0, 2);
+        const chosen = bestChoices[Math.floor(Math.random() * bestChoices.length)]!;
+
+        const currentGroup = [seed, ...chosen.subset];
         groups.push(currentGroup);
 
         const chosenIds = new Set(currentGroup.map((o) => o.id));
@@ -182,8 +251,15 @@ router.post("/optimize", async (req, res) => {
 
     try {
         db = await conn.getConnection();
-        await db.beginTransaction(); // Begin transaction; will rollback on error to protect DB integrity.
-        // Reset order statuses to pending before re-optimizing to allow repeated calculations.
+        await db.beginTransaction();
+
+        // 1. รีเซ็ตข้อมูลเดิมทั้งหมดเพื่อให้สามารถคำนวณใหม่ได้เรื่อยๆ โดยไม่ติด Foreign key หรือ status
+        await db.query(`
+            DELETE rs
+            FROM route_stops rs
+            INNER JOIN delivery_routes dr ON dr.id = rs.route_id
+        `);
+        await db.query("DELETE FROM delivery_routes");
         await db.query("UPDATE orders SET status = 'pending' WHERE status = 'assigned'");
 
         const shopLat = SHOP_CONFIG.latitude;
@@ -212,7 +288,7 @@ router.post("/optimize", async (req, res) => {
             return res.status(400).json({ error: "ไม่พบข้อมูลไรเดอร์ในระบบ" });
         }
 
-        // สร้างพิกัดสำหรับ OSRM Table API: [ร้านค้า, ออเดอร์1, ออเดอร์2, ...]
+        // สร้างพิกัดสำหรับ Distance Matrix: [ร้านค้า, ออเดอร์1, ออเดอร์2, ...]
         const coordinates = [
             { lat: shopLat, lng: shopLng },
             ...orders.map((o: any) => ({ lat: Number(o.latitude), lng: Number(o.longitude) }))
@@ -222,15 +298,11 @@ router.post("/optimize", async (req, res) => {
         // กำหนด index ของแต่ละออเดอร์ใน distance matrix (ร้านค้า = index 0)
         orders.forEach((o: any, idx: number) => { o._matrixIdx = idx + 1; });
 
-        // ขั้นที่ 1: จัดกลุ่มออเดอร์ (Knapsack + OSRM Distance Matrix)
+        // ขั้นที่ 1: จัดกลุ่มออเดอร์ (Knapsack + Distance Matrix พร้อม random exploration)
         const groups = groupOrdersKnapsack(orders, matrix);
-        // Remove all existing route stops and delivery routes regardless of status to ensure a clean slate.
-        await db.query(`
-            DELETE rs
-            FROM route_stops rs
-            INNER JOIN delivery_routes dr ON dr.id = rs.route_id
-        `);
-        await db.query("DELETE FROM delivery_routes");
+
+        // สุ่มสลับลำดับไรเดอร์เพื่อให้ไรเดอร์แต่ละคนสลับงานในแต่ละรอบที่กดคำนวณใหม่
+        const shuffledRiders = [...riders].sort(() => Math.random() - 0.5);
 
         const createdRoutes: any[] = [];
         let totalAllBoxes = 0;
@@ -241,7 +313,7 @@ router.post("/optimize", async (req, res) => {
         // ขั้นที่ 2: วิ่งหาลำดับส่งที่ดีที่สุดสำหรับแต่ละกลุ่ม และสร้างเส้นทาง
         for (let i = 0; i < groups.length; i++) {
             const group = groups[i]!;
-            const rider = riders[i % riders.length]!;
+            const rider = shuffledRiders[i % shuffledRiders.length]!;
             const jobCode = `JOB-${String(i + 1).padStart(2, "0")}`;
 
             // หาเส้นทางที่สั้นที่สุดในกลุ่ม (TSP: 3! = 6 รูปแบบ)

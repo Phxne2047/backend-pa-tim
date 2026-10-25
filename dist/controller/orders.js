@@ -33,6 +33,7 @@ const MENUS = [
     "ข้าวไข่เจียวหมูกรอบ",
     "ข้าวพริกแกงหมูใส่ถั่ว",
 ];
+//use
 exports.router.get("/", async (req, res) => {
     const shopLat = shop_1.SHOP_CONFIG.latitude;
     const shopLng = shop_1.SHOP_CONFIG.longitude;
@@ -83,6 +84,7 @@ exports.router.get("/:id", async (req, res) => {
         res.status(500).json({ error: "Internal server error" });
     }
 });
+//mock
 exports.router.post("/mock", async (req, res) => {
     try {
         let body = req.body || {};
@@ -144,6 +146,7 @@ exports.router.post("/mock", async (req, res) => {
         });
     }
 });
+//use
 exports.router.post("/", async (req, res) => {
     try {
         let order = req.body;
@@ -183,6 +186,7 @@ exports.router.delete("/all", async (req, res) => {
         res.status(500).json({ error: "Internal server error" });
     }
 });
+//use
 exports.router.delete("/:id", async (req, res) => {
     try {
         let id = req.params.id;
@@ -234,6 +238,7 @@ exports.router.put("/:id", async (req, res) => {
         res.status(500).json({ error: error instanceof Error ? error.message : "Internal server error" });
     }
 });
+//use
 exports.router.patch("/:id", async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
