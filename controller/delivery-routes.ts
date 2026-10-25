@@ -5,220 +5,170 @@ import { DeliveryRoute } from "../model/delivery-routes";
 import { SHOP_CONFIG } from "../config/shop";
 
 export const router = express.Router();
-const OSRM_BASE_URL = process.env.OSRM_BASE_URL || "https://router.project-osrm.org";
 
-
-// OSRM Table API: ดึง Distance Matrix ระยะทาง+เวลาจริงตามถนนทุกคู่จุดในครั้งเดียว
-interface DistanceMatrix {
-    distances: number[][]; // ระยะทาง (กม.)
-    durations: number[][]; // เวลาเดินทาง (นาที)
-}
-
-const matrixCache = new Map<string, DistanceMatrix>();
-
-function calculateHaversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-    const R = 6371; // Earth radius in km
+// ==========================================
+// 1. ฟังก์ชันคำนวณระยะทาง (Haversine Formula)
+// คำนวณระยะทางระหว่างจุด 2 จุดจากพิกัด Lat, Lng (กิโลเมตร)
+// ==========================================
+function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371; // รัศมีของโลก (กม.)
     const dLat = ((lat2 - lat1) * Math.PI) / 180;
     const dLon = ((lon2 - lon1) * Math.PI) / 180;
+
     const a =
         Math.sin(dLat / 2) * Math.sin(dLat / 2) +
         Math.cos((lat1 * Math.PI) / 180) *
         Math.cos((lat2 * Math.PI) / 180) *
         Math.sin(dLon / 2) *
         Math.sin(dLon / 2);
+
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return Number((R * c * 1.35).toFixed(2));
+    const straightDist = R * c;
+
+    // คูณ 1.35 เพื่อชดเชยระยะทางโค้งตามถนนจริง
+    return Number((straightDist * 1.35).toFixed(2));
 }
 
-function generateFallbackMatrix(coordinates: { lat: number; lng: number }[]): DistanceMatrix {
-    const n = coordinates.length;
-    const distances: number[][] = [];
-    const durations: number[][] = [];
-    for (let i = 0; i < n; i++) {
-        distances[i] = [];
-        durations[i] = [];
-        for (let j = 0; j < n; j++) {
-            if (i === j) {
-                distances[i]![j] = 0;
-                durations[i]![j] = 0;
-            } else {
-                const dist = calculateHaversineDistance(
-                    coordinates[i]!.lat,
-                    coordinates[i]!.lng,
-                    coordinates[j]!.lat,
-                    coordinates[j]!.lng
-                );
-                distances[i]![j] = dist;
-                durations[i]![j] = Number((dist * 2).toFixed(1));
-            }
-        }
-    }
-    return { distances, durations };
+// คำนวณเวลาเดินทาง (นาที) อิงจากมอเตอร์ไซค์ขับ 30 กม./ชม. (1 กม. = 2 นาที)
+function calculateDuration(distanceKm: number): number {
+    return Number((distanceKm * 2).toFixed(1));
 }
 
-async function fetchDistanceMatrix(coordinates: { lat: number; lng: number }[]): Promise<DistanceMatrix> {
-    const coordKey = coordinates.map((c) => `${c.lng.toFixed(5)},${c.lat.toFixed(5)}`).join(";");
-
-    if (matrixCache.has(coordKey)) {
-        return matrixCache.get(coordKey)!;
-    }
-
-    const coordString = coordinates.map((c) => `${c.lng},${c.lat}`).join(";");
-    const url = `${OSRM_BASE_URL}/table/v1/driving/${coordString}?annotations=distance,duration`;
-
-    try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 6000);
-
-        const res = await fetch(url, { signal: controller.signal });
-        clearTimeout(timeoutId);
-
-        const data: any = await res.json();
-        if (data.code === "Ok" && data.distances && data.durations) {
-            const matrix: DistanceMatrix = {
-                distances: data.distances.map((row: number[]) =>
-                    row.map((d: number) => Number((d / 1000).toFixed(2)))
-                ),
-                durations: data.durations.map((row: number[]) =>
-                    row.map((d: number) => Number((d / 60).toFixed(1)))
-                ),
-            };
-            matrixCache.set(coordKey, matrix);
-            return matrix;
-        }
-    } catch (err) {
-        console.warn("OSRM table request failed or timed out, using road estimate fallback:", err);
-    }
-
-    const fallback = generateFallbackMatrix(coordinates);
-    matrixCache.set(coordKey, fallback);
-    return fallback;
-}
-
-//จัดกลุ่มออเดอร์ด้วย Knapsack + OSRM Distance Matrix พร้อมรองรับการสร้างทางเลือกใหม่ๆ เมื่อกดคำนวณซ้ำ
-function groupOrdersKnapsack(orders: any[], distMatrix: DistanceMatrix): any[][] {
-    // สุ่มจัดลำดับออเดอร์ที่มีกล่องเท่ากัน เพื่อเปิดโอกาสให้ระบบสร้างทางเลือกใหม่ๆ ทุกครั้งที่กดคำนวณใหม่
-    let unassigned = [...orders].sort((a, b) => {
-        if (b.boxes !== a.boxes) {
-            return b.boxes - a.boxes;
-        }
-        return Math.random() - 0.5;
-    });
-
+// ==========================================
+// 2. ฟังก์ชันจัดกลุ่มออเดอร์ให้ไรเดอร์ (Nearest Neighbor Clustered)
+// เงื่อนไข: 1 ไรเดอร์ รับไม่เกิน 3 ออเดอร์ และไม่เกิน 10 กล่อง
+// ==========================================
+function groupOrdersForRiders(orders: any[]): any[][] {
+    // สุ่มสลับออเดอร์ก่อนจัดกลุ่ม เพื่อให้ได้เส้นทางที่แตกต่างกันทุกครั้งที่กดคำนวณใหม่
+    let remaining = [...orders].sort(() => Math.random() - 0.5);
     const groups: any[][] = [];
 
-    while (unassigned.length > 0) {
-        // สุ่มเลือก seed จาก 2 ออเดอร์แรกที่มีขนาดกล่องใหญ่ เพื่อกระจายทางเลือก
-        const seedIdx = Math.min(Math.floor(Math.random() * 2), unassigned.length - 1);
-        const seed = unassigned[seedIdx]!;
-        const remaining = unassigned.filter((_, idx) => idx !== seedIdx);
+    while (remaining.length > 0) {
+        // หยิบออเดอร์แรกมาเป็นจุดตั้งต้นของกลุ่ม
+        const group: any[] = [remaining[0]];
+        let currentBoxes = Number(remaining[0].boxes);
+        let currentLat = Number(remaining[0].latitude);
+        let currentLng = Number(remaining[0].longitude);
 
-        const candidates: { subset: any[]; totalB: number; dist: number }[] = [];
+        remaining.splice(0, 1);
 
-        // ทางเลือก: ส่งเดี่ยว 1 ออเดอร์
-        candidates.push({ subset: [], totalB: seed.boxes, dist: 0 });
+        // วนหาออเดอร์อื่นที่อยู่ใกล้ที่สุดมารวมกลุ่ม (ไม่เกิน 3 ออเดอร์ และรวมกันไม่เกิน 10 กล่อง)
+        while (group.length < 3 && remaining.length > 0) {
+            let bestIndex = -1;
+            let minDistance = Infinity;
 
-        // เพิ่ม 1 ออเดอร์ (รวมเป็น 2 ออเดอร์)
-        for (let i = 0; i < remaining.length; i++) {
-            const item1 = remaining[i]!;
-            const totalB = seed.boxes + item1.boxes;
-            if (totalB <= 10) {
-                const d = distMatrix.distances[seed._matrixIdx]![item1._matrixIdx]!;
-                candidates.push({ subset: [item1], totalB, dist: d });
-            }
-        }
+            for (let i = 0; i < remaining.length; i++) {
+                const candidate = remaining[i];
+                const boxCount = Number(candidate.boxes);
 
-        // เพิ่ม 2 ออเดอร์ (รวมเป็น 3 ออเดอร์ สูงสุดตามกฎไรเดอร์รับไม่เกิน 3 ออเดอร์)
-        for (let i = 0; i < remaining.length; i++) {
-            for (let j = i + 1; j < remaining.length; j++) {
-                const item1 = remaining[i]!;
-                const item2 = remaining[j]!;
-                const totalB = seed.boxes + item1.boxes + item2.boxes;
-                if (totalB <= 10) {
-                    const d =
-                        distMatrix.distances[seed._matrixIdx]![item1._matrixIdx]! +
-                        distMatrix.distances[seed._matrixIdx]![item2._matrixIdx]! +
-                        distMatrix.distances[item1._matrixIdx]![item2._matrixIdx]!;
-                    candidates.push({ subset: [item1, item2], totalB, dist: d });
+                // เช็คเงื่อนไขกล่องรวมต้องไม่เกิน 10 กล่อง
+                if (currentBoxes + boxCount <= 10) {
+                    const dist = calculateDistance(
+                        currentLat,
+                        currentLng,
+                        Number(candidate.latitude),
+                        Number(candidate.longitude)
+                    );
+                    if (dist < minDistance) {
+                        minDistance = dist;
+                        bestIndex = i;
+                    }
                 }
             }
+
+            // ถ้าเจอออเดอร์ใกล้เคียงที่รวมได้
+            if (bestIndex !== -1) {
+                const matched = remaining[bestIndex];
+                group.push(matched);
+                currentBoxes += Number(matched.boxes);
+                currentLat = Number(matched.latitude);
+                currentLng = Number(matched.longitude);
+                remaining.splice(bestIndex, 1);
+            } else {
+                // ถ้าไม่มีออเดอร์ไหนรวมแล้วไม่เกิน 10 กล่อง ให้จบลูปกลุ่มนี้
+                break;
+            }
         }
 
-        // เรียงลำดับ candidates:
-        // 1. บรรจุกล่องได้มากที่สุดก่อน (Knapsack)
-        // 2. ระยะทางรวมสั้นที่สุด
-        candidates.sort((a, b) => b.totalB - a.totalB || a.dist - b.dist);
-
-        // คัดกรองตัวเลือกที่มีกล่องสูงสุด และเลือกจาก top 2 ตัวเลือกที่ดีที่สุดแบบ stochastic
-        const maxBoxes = candidates[0]!.totalB;
-        const topCandidates = candidates.filter((c) => c.totalB === maxBoxes);
-        const bestChoices = topCandidates.slice(0, 2);
-        const chosen = bestChoices[Math.floor(Math.random() * bestChoices.length)]!;
-
-        const currentGroup = [seed, ...chosen.subset];
-        groups.push(currentGroup);
-
-        const chosenIds = new Set(currentGroup.map((o) => o.id));
-        unassigned = unassigned.filter((o) => !chosenIds.has(o.id));
+        groups.push(group);
     }
 
     return groups;
 }
 
-//สลับลำดับจุดส่งในกลุ่มให้สั้นที่สุด
-function getPermutations<T>(arr: T[]): T[][] {
-    if (arr.length <= 1) return [arr];
-    const result: T[][] = [];
-    for (let i = 0; i < arr.length; i++) {
-        const current = arr[i]!;
-        const remaining = arr.slice(0, i).concat(arr.slice(i + 1));
-        for (const p of getPermutations(remaining)) {
-            result.push([current, ...p]);
-        }
-    }
-    return result;
-}
+// ==========================================
+// 3. ฟังก์ชันเรียงลำดับจุดส่งในกลุ่มให้สั้นที่สุด
+// (ร้านค้า -> จุดที่ 1 -> จุดที่ 2 -> จุดที่ 3)
+// ==========================================
+function sortStops(stops: any[], shopLat: number, shopLng: number): any[] {
+    if (stops.length <= 1) return stops;
 
-function findOptimalRoute(group: any[], distMatrix: DistanceMatrix, shopIdx: number): any[] {
-    if (group.length <= 1) return group;
+    // กรณีมี 2 จุด: เปรียบเทียบว่า ร้าน->1->2 หรือ ร้าน->2->1 สั้นกว่ากัน
+    if (stops.length === 2) {
+        const d1 =
+            calculateDistance(shopLat, shopLng, Number(stops[0].latitude), Number(stops[0].longitude)) +
+            calculateDistance(Number(stops[0].latitude), Number(stops[0].longitude), Number(stops[1].latitude), Number(stops[1].longitude));
 
-    const allPermutations = getPermutations(group);
-    let bestPermutation = group;
-    let minTotalDist = Infinity;
+        const d2 =
+            calculateDistance(shopLat, shopLng, Number(stops[1].latitude), Number(stops[1].longitude)) +
+            calculateDistance(Number(stops[1].latitude), Number(stops[1].longitude), Number(stops[0].latitude), Number(stops[0].longitude));
 
-    for (const perm of allPermutations) {
-        let totalDist = 0;
-        let prevIdx = shopIdx;
-
-        for (const ord of perm) {
-            totalDist += distMatrix.distances[prevIdx]![ord._matrixIdx]!;
-            prevIdx = ord._matrixIdx;
-        }
-
-        if (totalDist < minTotalDist) {
-            minTotalDist = totalDist;
-            bestPermutation = perm;
-        }
+        return d1 <= d2 ? [stops[0], stops[1]] : [stops[1], stops[0]];
     }
 
-    return bestPermutation;
+    // กรณีมี 3 จุด: ตรวจสอบทั้ง 6 รูปแบบเพื่อหาเส้นทางที่สั้นที่สุด
+    const permutations = [
+        [0, 1, 2], [0, 2, 1],
+        [1, 0, 2], [1, 2, 0],
+        [2, 0, 1], [2, 1, 0],
+    ];
+
+    let bestStops = [stops[0], stops[1], stops[2]];
+    let minDistance = Infinity;
+
+    for (const p of permutations) {
+        const idx0 = p[0]!;
+        const idx1 = p[1]!;
+        const idx2 = p[2]!;
+
+        const s1 = stops[idx0]!;
+        const s2 = stops[idx1]!;
+        const s3 = stops[idx2]!;
+
+        const totalDist =
+            calculateDistance(shopLat, shopLng, Number(s1.latitude), Number(s1.longitude)) +
+            calculateDistance(Number(s1.latitude), Number(s1.longitude), Number(s2.latitude), Number(s2.longitude)) +
+            calculateDistance(Number(s2.latitude), Number(s2.longitude), Number(s3.latitude), Number(s3.longitude));
+
+        if (totalDist < minDistance) {
+            minDistance = totalDist;
+            bestStops = [s1, s2, s3];
+        }
+    }
+
+    return bestStops;
 }
 
+// ==========================================
+// API Endpoints
+// ==========================================
 
+// ดึงข้อมูลสายส่งทั้งหมด
 router.get("/", async (req, res) => {
     try {
         const [rows] = await conn.query("SELECT * FROM delivery_routes");
-        let deliveryRoutes = rows as DeliveryRoute[];
+        const deliveryRoutes = rows as DeliveryRoute[];
         res.json(deliveryRoutes);
     } catch (error) {
         res.status(500).json({ error: "Internal server error" });
     }
 });
 
+// บันทึกสายส่งรายตัว
 router.post("/", async (req, res) => {
     try {
-        let deliveryRoute: DeliveryRoute = req.body;
-        let sql =
+        const deliveryRoute: DeliveryRoute = req.body;
+        const sql =
             "INSERT INTO `delivery_routes`(`rider_id`, `job_code`, `total_orders`, `total_boxes`, `total_distance`, `time_delivery`, `delivery_peice`, `net_profit`, `status`) VALUES (?,?,?,?,?,?,?,?,?)";
 
         const [result] = await conn.query(sql, [
@@ -242,6 +192,10 @@ router.post("/", async (req, res) => {
     }
 });
 
+// ==========================================
+// POST /delivery-routes/optimize
+// คำนวณเส้นทางใหม่: ล้างข้อมูลเดิม -> จัดกลุ่มเส้นทางใหม่ -> บันทึก Database
+// ==========================================
 router.post("/optimize", async (req, res) => {
     let db: PoolConnection | undefined;
 
@@ -249,24 +203,17 @@ router.post("/optimize", async (req, res) => {
         db = await conn.getConnection();
         await db.beginTransaction();
 
-        // 1. รีเซ็ตข้อมูลเดิมทั้งหมดเพื่อให้สามารถคำนวณใหม่ได้เรื่อยๆ โดยไม่ติด Foreign key หรือ status
-        await db.query(`
-            DELETE rs
-            FROM route_stops rs
-            INNER JOIN delivery_routes dr ON dr.id = rs.route_id
-        `);
+        // 1. ล้างข้อมูลเดิมทั้งหมดก่อน เพื่อไม่ให้มีข้อมูลตกค้าง
+        await db.query("DELETE FROM route_stops");
         await db.query("DELETE FROM delivery_routes");
-        await db.query("UPDATE orders SET status = 'pending' WHERE status = 'assigned'");
+        await db.query("UPDATE orders SET status = 'pending'");
 
-        const shopLat = SHOP_CONFIG.latitude;
-        const shopLng = SHOP_CONFIG.longitude;
-
+        // 2. ดึงออเดอร์ที่พร้อมจัดส่ง
         const [orderRows]: any = await db.query(`
             SELECT o.id, o.customer_id, o.boxes, o.menu, o.status,
                    c.name AS customer_name, c.phone AS customer_phone, c.address, c.latitude, c.longitude
             FROM orders o
             INNER JOIN customers c ON o.customer_id = c.id
-            WHERE o.status IN ('pending', 'assigned')
             ORDER BY o.id ASC
             FOR UPDATE
         `);
@@ -277,6 +224,7 @@ router.post("/optimize", async (req, res) => {
             return res.status(400).json({ error: "ไม่พบออเดอร์ที่พร้อมจัดส่งในระบบ" });
         }
 
+        // 3. ดึงไรเดอร์ทั้งหมด
         const [riderRows]: any = await db.query("SELECT * FROM riders");
         const riders: any[] = riderRows;
         if (riders.length === 0) {
@@ -284,72 +232,79 @@ router.post("/optimize", async (req, res) => {
             return res.status(400).json({ error: "ไม่พบข้อมูลไรเดอร์ในระบบ" });
         }
 
-        // สร้างพิกัดสำหรับ Distance Matrix: [ร้านค้า, ออเดอร์1, ออเดอร์2, ...]
-        const coordinates = [
-            { lat: shopLat, lng: shopLng },
-            ...orders.map((o: any) => ({ lat: Number(o.latitude), lng: Number(o.longitude) }))
-        ];
-        const matrix = await fetchDistanceMatrix(coordinates);
+        // 4. จัดกลุ่มออเดอร์ (แต่ละกลุ่มไม่เกิน 3 ออเดอร์ และไม่เกิน 10 กล่อง)
+        // เมื่อกดแต่ละครั้ง การสุ่มลำดับตั้งต้นจะทำให้กลุ่มเส้นทางและระยะทางเปลี่ยนไปอย่างชัดเจน
+        const groups = groupOrdersForRiders(orders);
 
-        // กำหนด index ของแต่ละออเดอร์ใน distance matrix (ร้านค้า = index 0)
-        orders.forEach((o: any, idx: number) => { o._matrixIdx = idx + 1; });
-
-        // ขั้นที่ 1: จัดกลุ่มออเดอร์ (Knapsack + Distance Matrix พร้อม random exploration)
-        const groups = groupOrdersKnapsack(orders, matrix);
-
-        // สุ่มสลับลำดับไรเดอร์เพื่อให้ไรเดอร์แต่ละคนสลับงานในแต่ละรอบที่กดคำนวณใหม่
+        // สุ่มสลับไรเดอร์เพื่อกระจายงาน
         const shuffledRiders = [...riders].sort(() => Math.random() - 0.5);
+
+        const shopLat = SHOP_CONFIG.latitude;
+        const shopLng = SHOP_CONFIG.longitude;
 
         const createdRoutes: any[] = [];
         let totalAllBoxes = 0;
         let totalAllOrders = 0;
         let totalAllDeliveryCost = 0;
         let maxDeliveryTime = 0;
-        const allAssignedOrderIds: number[] = [];
 
-        // ขั้นที่ 2: วิ่งหาลำดับส่งที่ดีที่สุดสำหรับแต่ละกลุ่ม และสร้างเส้นทาง
+        // 5. วนลูปสร้างแต่ละสายส่ง และบันทึกลง Database
         for (let i = 0; i < groups.length; i++) {
-            const group = groups[i]!;
+            const rawGroup = groups[i]!;
             const rider = shuffledRiders[i % shuffledRiders.length]!;
             const jobCode = `JOB-${String(i + 1).padStart(2, "0")}`;
 
-            // หาเส้นทางที่สั้นที่สุดในกลุ่ม (TSP: 3! = 6 รูปแบบ)
-            const optimalStops = findOptimalRoute(group, matrix, 0);
+            // จัดเรียงลำดับจุดส่งให้สั้นที่สุด
+            const sortedGroup = sortStops(rawGroup, shopLat, shopLng);
 
             let totalGroupBoxes = 0;
             let totalGroupDistance = 0;
             let cumulativeTime = 0;
             const stopsData: any[] = [];
 
-            for (let j = 0; j < optimalStops.length; j++) {
-                const ord = optimalStops[j]!;
-                totalGroupBoxes += ord.boxes;
+            let previousLat = shopLat;
+            let previousLng = shopLng;
 
-                const prevIdx = j === 0 ? 0 : optimalStops[j - 1]!._matrixIdx;
-                const dist: number = matrix.distances[prevIdx]![ord._matrixIdx]!;
-                const timeForThisLeg: number = matrix.durations[prevIdx]![ord._matrixIdx]!;
+            for (let j = 0; j < sortedGroup.length; j++) {
+                const order = sortedGroup[j];
+                const boxCount = Number(order.boxes);
+                totalGroupBoxes += boxCount;
+
+                const curLat = Number(order.latitude);
+                const curLng = Number(order.longitude);
+
+                // คำนวณระยะทางจากจุดก่อนหน้า
+                const dist = calculateDistance(previousLat, previousLng, curLat, curLng);
+                const timeThisLeg = calculateDuration(dist);
+
                 totalGroupDistance += dist;
-                cumulativeTime += timeForThisLeg;
+                cumulativeTime += timeThisLeg;
 
                 stopsData.push({
-                    order: ord,
+                    order: order,
                     stop_number: j + 1,
                     distance_before: dist,
                     total_time: Number(cumulativeTime.toFixed(1)),
                 });
+
+                previousLat = curLat;
+                previousLng = curLng;
             }
 
             totalGroupDistance = Number(totalGroupDistance.toFixed(2));
             const timeDelivery = Number(cumulativeTime.toFixed(1));
 
+            // คำนวณค่าส่ง: 15 บาท + (ระยะทางรวม * 2 บาท * จำนวนกล่อง)
             const deliveryFee = Number(
                 (SHOP_CONFIG.rider_base_fee + totalGroupDistance * SHOP_CONFIG.rider_fee_per_km_box * totalGroupBoxes).toFixed(2)
             );
 
+            // คำนวณกำไรสุทธิ: (กล่องรวม * 25 บาท) - ค่าส่ง
             const netProfit = Number(
                 (totalGroupBoxes * (SHOP_CONFIG.box_price - SHOP_CONFIG.food_cost) - deliveryFee).toFixed(2)
             );
 
+            // บันทึกสายส่งลงตาราง delivery_routes
             const insertRouteSql = `
                 INSERT INTO delivery_routes (rider_id, job_code, total_orders, total_boxes, total_distance, time_delivery, delivery_peice, net_profit, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
@@ -357,7 +312,7 @@ router.post("/optimize", async (req, res) => {
             const [routeResult]: any = await db.query(insertRouteSql, [
                 rider.id,
                 jobCode,
-                optimalStops.length,
+                sortedGroup.length,
                 totalGroupBoxes,
                 totalGroupDistance,
                 timeDelivery,
@@ -366,6 +321,7 @@ router.post("/optimize", async (req, res) => {
             ]);
             const routeId = routeResult.insertId;
 
+            // บันทึกจุดส่งลงตาราง route_stops
             const savedStops: any[] = [];
             for (const stop of stopsData) {
                 const insertStopSql = `
@@ -380,10 +336,12 @@ router.post("/optimize", async (req, res) => {
                     stop.total_time,
                 ]);
 
+                // อัปเดตสถานะออเดอร์เป็น assigned
                 await db.query("UPDATE orders SET status = 'assigned' WHERE id = ?", [stop.order.id]);
 
                 const lat = Number(stop.order.latitude);
                 const lng = Number(stop.order.longitude);
+
                 savedStops.push({
                     stop_id: stopResult.insertId,
                     stop_number: stop.stop_number,
@@ -403,7 +361,7 @@ router.post("/optimize", async (req, res) => {
             }
 
             totalAllBoxes += totalGroupBoxes;
-            totalAllOrders += group.length;
+            totalAllOrders += sortedGroup.length;
             totalAllDeliveryCost += deliveryFee;
             if (timeDelivery > maxDeliveryTime) {
                 maxDeliveryTime = timeDelivery;
@@ -416,7 +374,7 @@ router.post("/optimize", async (req, res) => {
                 rider_name: rider.name,
                 rider_phone: rider.phone,
                 route_color: rider.color,
-                total_orders: group.length,
+                total_orders: sortedGroup.length,
                 total_boxes: totalGroupBoxes,
                 total_distance_km: totalGroupDistance,
                 estimated_time_min: timeDelivery,
@@ -427,7 +385,7 @@ router.post("/optimize", async (req, res) => {
             });
         }
 
-        //แดชบอรืด
+        // 6. สรุปข้อมูลสำหรับแผงวิเคราะห์ทางการเงินและเวลา
         const totalRevenue = totalAllBoxes * SHOP_CONFIG.box_price;
         const totalFoodCost = totalAllBoxes * SHOP_CONFIG.food_cost;
         const totalGrossProfit = totalAllBoxes * (SHOP_CONFIG.box_price - SHOP_CONFIG.food_cost);
@@ -471,6 +429,10 @@ router.post("/optimize", async (req, res) => {
     }
 });
 
+// ==========================================
+// GET /delivery-routes/all
+// ดึงข้อมูลรอบจัดส่งล่าสุดที่บันทึกไว้ใน Database
+// ==========================================
 router.get("/all", async (req, res) => {
     try {
         const [routeRows]: any = await conn.query(`
@@ -594,6 +556,10 @@ router.get("/all", async (req, res) => {
     }
 });
 
+// ==========================================
+// GET /delivery-routes/job/:jobCode
+// ดึงข้อมูลใบงานสำหรับไรเดอร์ดูผ่านมือถือ
+// ==========================================
 router.get("/job/:jobCode", async (req, res) => {
     try {
         const jobCode = req.params.jobCode;
@@ -659,6 +625,10 @@ router.get("/job/:jobCode", async (req, res) => {
     }
 });
 
+// ==========================================
+// PATCH /delivery-routes/stops/:stopId/status
+// ไรเดอร์อัปเดตสถานะส่งสำเร็จ
+// ==========================================
 router.patch("/stops/:stopId/status", async (req, res) => {
     try {
         const stopId = parseInt(req.params.stopId, 10);
@@ -695,6 +665,10 @@ router.patch("/stops/:stopId/status", async (req, res) => {
     }
 });
 
+// ==========================================
+// DELETE /delivery-routes/all
+// ล้างข้อมูลรอบจัดส่งทั้งหมด
+// ==========================================
 router.delete("/all", async (req, res) => {
     try {
         await conn.query("DELETE FROM route_stops");
