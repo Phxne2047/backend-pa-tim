@@ -6,10 +6,7 @@ import { SHOP_CONFIG } from "../config/shop";
 
 export const router = express.Router();
 
-// ==========================================
-// 1. ฟังก์ชันคำนวณระยะทาง (Haversine Formula)
-// คำนวณระยะทางระหว่างจุด 2 จุดจากพิกัด Lat, Lng (กิโลเมตร)
-// ==========================================
+//คำนวณระยะทาง ระหว่างจุด 2 จุดจากพิกัด
 function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
     const R = 6371; // รัศมีของโลก (กม.)
     const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -29,22 +26,17 @@ function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: numbe
     return Number((straightDist * 1.35).toFixed(2));
 }
 
-// คำนวณเวลาเดินทาง (นาที) อิงจากมอเตอร์ไซค์ขับ 30 กม./ชม. (1 กม. = 2 นาที)
+//คำนวณเวลาเดินทาง ขับ 30 กม./ชม. (1 กม. = 2 นาที)
 function calculateDuration(distanceKm: number): number {
     return Number((distanceKm * 2).toFixed(1));
 }
 
-// ==========================================
-// 2. ฟังก์ชันจัดกลุ่มออเดอร์ให้ไรเดอร์ (Nearest Neighbor Clustered)
-// เงื่อนไข: 1 ไรเดอร์ รับไม่เกิน 3 ออเดอร์ และไม่เกิน 10 กล่อง
-// ==========================================
+//จัดกลุ่มออเดอร์ให้ไรเดอร์
 function groupOrdersForRiders(orders: any[]): any[][] {
-    // สุ่มสลับออเดอร์ก่อนจัดกลุ่ม เพื่อให้ได้เส้นทางที่แตกต่างกันทุกครั้งที่กดคำนวณใหม่
     let remaining = [...orders].sort(() => Math.random() - 0.5);
     const groups: any[][] = [];
 
     while (remaining.length > 0) {
-        // หยิบออเดอร์แรกมาเป็นจุดตั้งต้นของกลุ่ม
         const group: any[] = [remaining[0]];
         let currentBoxes = Number(remaining[0].boxes);
         let currentLat = Number(remaining[0].latitude);
@@ -52,7 +44,6 @@ function groupOrdersForRiders(orders: any[]): any[][] {
 
         remaining.splice(0, 1);
 
-        // วนหาออเดอร์อื่นที่อยู่ใกล้ที่สุดมารวมกลุ่ม (ไม่เกิน 3 ออเดอร์ และรวมกันไม่เกิน 10 กล่อง)
         while (group.length < 3 && remaining.length > 0) {
             let bestIndex = -1;
             let minDistance = Infinity;
@@ -61,7 +52,6 @@ function groupOrdersForRiders(orders: any[]): any[][] {
                 const candidate = remaining[i];
                 const boxCount = Number(candidate.boxes);
 
-                // เช็คเงื่อนไขกล่องรวมต้องไม่เกิน 10 กล่อง
                 if (currentBoxes + boxCount <= 10) {
                     const dist = calculateDistance(
                         currentLat,
@@ -76,7 +66,6 @@ function groupOrdersForRiders(orders: any[]): any[][] {
                 }
             }
 
-            // ถ้าเจอออเดอร์ใกล้เคียงที่รวมได้
             if (bestIndex !== -1) {
                 const matched = remaining[bestIndex];
                 group.push(matched);
@@ -85,7 +74,6 @@ function groupOrdersForRiders(orders: any[]): any[][] {
                 currentLng = Number(matched.longitude);
                 remaining.splice(bestIndex, 1);
             } else {
-                // ถ้าไม่มีออเดอร์ไหนรวมแล้วไม่เกิน 10 กล่อง ให้จบลูปกลุ่มนี้
                 break;
             }
         }
@@ -96,14 +84,11 @@ function groupOrdersForRiders(orders: any[]): any[][] {
     return groups;
 }
 
-// ==========================================
-// 3. ฟังก์ชันเรียงลำดับจุดส่งในกลุ่มให้สั้นที่สุด
-// (ร้านค้า -> จุดที่ 1 -> จุดที่ 2 -> จุดที่ 3)
-// ==========================================
+//เรียงลำดับจุดส่งในกลุ่มให้สั้นที่สุด
 function sortStops(stops: any[], shopLat: number, shopLng: number): any[] {
     if (stops.length <= 1) return stops;
 
-    // กรณีมี 2 จุด: เปรียบเทียบว่า ร้าน->1->2 หรือ ร้าน->2->1 สั้นกว่ากัน
+    //กรณีมี 2 จุด
     if (stops.length === 2) {
         const d1 =
             calculateDistance(shopLat, shopLng, Number(stops[0].latitude), Number(stops[0].longitude)) +
@@ -116,7 +101,7 @@ function sortStops(stops: any[], shopLat: number, shopLng: number): any[] {
         return d1 <= d2 ? [stops[0], stops[1]] : [stops[1], stops[0]];
     }
 
-    // กรณีมี 3 จุด: ตรวจสอบทั้ง 6 รูปแบบเพื่อหาเส้นทางที่สั้นที่สุด
+    //กรณีมี 3 จุด
     const permutations = [
         [0, 1, 2], [0, 2, 1],
         [1, 0, 2], [1, 2, 0],
@@ -149,11 +134,6 @@ function sortStops(stops: any[], shopLat: number, shopLng: number): any[] {
     return bestStops;
 }
 
-// ==========================================
-// API Endpoints
-// ==========================================
-
-// ดึงข้อมูลสายส่งทั้งหมด
 router.get("/", async (req, res) => {
     try {
         const [rows] = await conn.query("SELECT * FROM delivery_routes");
@@ -164,7 +144,6 @@ router.get("/", async (req, res) => {
     }
 });
 
-// บันทึกสายส่งรายตัว
 router.post("/", async (req, res) => {
     try {
         const deliveryRoute: DeliveryRoute = req.body;
@@ -192,10 +171,7 @@ router.post("/", async (req, res) => {
     }
 });
 
-// ==========================================
-// POST /delivery-routes/optimize
-// คำนวณเส้นทางใหม่: ล้างข้อมูลเดิม -> จัดกลุ่มเส้นทางใหม่ -> บันทึก Database
-// ==========================================
+//คำนวณเส้นทางใหม่
 router.post("/optimize", async (req, res) => {
     let db: PoolConnection | undefined;
 
@@ -203,12 +179,10 @@ router.post("/optimize", async (req, res) => {
         db = await conn.getConnection();
         await db.beginTransaction();
 
-        // 1. ล้างข้อมูลเดิมทั้งหมดก่อน เพื่อไม่ให้มีข้อมูลตกค้าง
         await db.query("DELETE FROM route_stops");
         await db.query("DELETE FROM delivery_routes");
         await db.query("UPDATE orders SET status = 'pending'");
 
-        // 2. ดึงออเดอร์ที่พร้อมจัดส่ง
         const [orderRows]: any = await db.query(`
             SELECT o.id, o.customer_id, o.boxes, o.menu, o.status,
                    c.name AS customer_name, c.phone AS customer_phone, c.address, c.latitude, c.longitude
@@ -224,7 +198,6 @@ router.post("/optimize", async (req, res) => {
             return res.status(400).json({ error: "ไม่พบออเดอร์ที่พร้อมจัดส่งในระบบ" });
         }
 
-        // 3. ดึงไรเดอร์ทั้งหมด
         const [riderRows]: any = await db.query("SELECT * FROM riders");
         const riders: any[] = riderRows;
         if (riders.length === 0) {
@@ -232,11 +205,8 @@ router.post("/optimize", async (req, res) => {
             return res.status(400).json({ error: "ไม่พบข้อมูลไรเดอร์ในระบบ" });
         }
 
-        // 4. จัดกลุ่มออเดอร์ (แต่ละกลุ่มไม่เกิน 3 ออเดอร์ และไม่เกิน 10 กล่อง)
-        // เมื่อกดแต่ละครั้ง การสุ่มลำดับตั้งต้นจะทำให้กลุ่มเส้นทางและระยะทางเปลี่ยนไปอย่างชัดเจน
         const groups = groupOrdersForRiders(orders);
 
-        // สุ่มสลับไรเดอร์เพื่อกระจายงาน
         const shuffledRiders = [...riders].sort(() => Math.random() - 0.5);
 
         const shopLat = SHOP_CONFIG.latitude;
@@ -248,13 +218,11 @@ router.post("/optimize", async (req, res) => {
         let totalAllDeliveryCost = 0;
         let maxDeliveryTime = 0;
 
-        // 5. วนลูปสร้างแต่ละสายส่ง และบันทึกลง Database
         for (let i = 0; i < groups.length; i++) {
             const rawGroup = groups[i]!;
             const rider = shuffledRiders[i % shuffledRiders.length]!;
             const jobCode = `JOB-${String(i + 1).padStart(2, "0")}`;
 
-            // จัดเรียงลำดับจุดส่งให้สั้นที่สุด
             const sortedGroup = sortStops(rawGroup, shopLat, shopLng);
 
             let totalGroupBoxes = 0;
@@ -273,7 +241,6 @@ router.post("/optimize", async (req, res) => {
                 const curLat = Number(order.latitude);
                 const curLng = Number(order.longitude);
 
-                // คำนวณระยะทางจากจุดก่อนหน้า
                 const dist = calculateDistance(previousLat, previousLng, curLat, curLng);
                 const timeThisLeg = calculateDuration(dist);
 
@@ -294,17 +261,14 @@ router.post("/optimize", async (req, res) => {
             totalGroupDistance = Number(totalGroupDistance.toFixed(2));
             const timeDelivery = Number(cumulativeTime.toFixed(1));
 
-            // คำนวณค่าส่ง: 15 บาท + (ระยะทางรวม * 2 บาท * จำนวนกล่อง)
             const deliveryFee = Number(
                 (SHOP_CONFIG.rider_base_fee + totalGroupDistance * SHOP_CONFIG.rider_fee_per_km_box * totalGroupBoxes).toFixed(2)
             );
 
-            // คำนวณกำไรสุทธิ: (กล่องรวม * 25 บาท) - ค่าส่ง
             const netProfit = Number(
                 (totalGroupBoxes * (SHOP_CONFIG.box_price - SHOP_CONFIG.food_cost) - deliveryFee).toFixed(2)
             );
 
-            // บันทึกสายส่งลงตาราง delivery_routes
             const insertRouteSql = `
                 INSERT INTO delivery_routes (rider_id, job_code, total_orders, total_boxes, total_distance, time_delivery, delivery_peice, net_profit, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
@@ -321,7 +285,6 @@ router.post("/optimize", async (req, res) => {
             ]);
             const routeId = routeResult.insertId;
 
-            // บันทึกจุดส่งลงตาราง route_stops
             const savedStops: any[] = [];
             for (const stop of stopsData) {
                 const insertStopSql = `
@@ -336,7 +299,6 @@ router.post("/optimize", async (req, res) => {
                     stop.total_time,
                 ]);
 
-                // อัปเดตสถานะออเดอร์เป็น assigned
                 await db.query("UPDATE orders SET status = 'assigned' WHERE id = ?", [stop.order.id]);
 
                 const lat = Number(stop.order.latitude);
@@ -385,7 +347,6 @@ router.post("/optimize", async (req, res) => {
             });
         }
 
-        // 6. สรุปข้อมูลสำหรับแผงวิเคราะห์ทางการเงินและเวลา
         const totalRevenue = totalAllBoxes * SHOP_CONFIG.box_price;
         const totalFoodCost = totalAllBoxes * SHOP_CONFIG.food_cost;
         const totalGrossProfit = totalAllBoxes * (SHOP_CONFIG.box_price - SHOP_CONFIG.food_cost);
@@ -429,10 +390,6 @@ router.post("/optimize", async (req, res) => {
     }
 });
 
-// ==========================================
-// GET /delivery-routes/all
-// ดึงข้อมูลรอบจัดส่งล่าสุดที่บันทึกไว้ใน Database
-// ==========================================
 router.get("/all", async (req, res) => {
     try {
         const [routeRows]: any = await conn.query(`
@@ -568,10 +525,6 @@ router.get("/all", async (req, res) => {
     }
 });
 
-// ==========================================
-// GET /delivery-routes/job/:jobCode
-// ดึงข้อมูลใบงานสำหรับไรเดอร์ดูผ่านมือถือ
-// ==========================================
 router.get("/job/:jobCode", async (req, res) => {
     try {
         const jobCode = req.params.jobCode;
@@ -637,10 +590,6 @@ router.get("/job/:jobCode", async (req, res) => {
     }
 });
 
-// ==========================================
-// PATCH /delivery-routes/stops/:stopId/status
-// ไรเดอร์อัปเดตสถานะส่งสำเร็จ
-// ==========================================
 router.patch("/stops/:stopId/status", async (req, res) => {
     try {
         const stopId = parseInt(req.params.stopId, 10);
@@ -677,10 +626,6 @@ router.patch("/stops/:stopId/status", async (req, res) => {
     }
 });
 
-// ==========================================
-// DELETE /delivery-routes/all
-// ล้างข้อมูลรอบจัดส่งทั้งหมด
-// ==========================================
 router.delete("/all", async (req, res) => {
     try {
         await conn.query("DELETE FROM route_stops");
