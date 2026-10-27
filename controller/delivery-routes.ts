@@ -6,6 +6,33 @@ import { SHOP_CONFIG } from "../config/shop";
 
 export const router = express.Router();
 
+
+// ฟังก์ชันดึงระยะทางถนนจริงและเวลาเดินทางจริงจาก OSRM API
+async function getOSRMRoute(coordinates: Array<[number, number]>): Promise<{ distanceKm: number; durationMin: number } | null> {
+    try {
+        // OSRM รับพิกัดในรูปแบบ longitude,latitude
+        const coordString = coordinates.map(c => `${c[1]},${c[0]}`).join(";");
+        const url = `https://router.project-osrm.org/route/v1/driving/${coordString}?overview=false`;
+
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (data.code === "Ok" && data.routes && data.routes.length > 0) {
+            const route = data.routes[0];
+            return {
+                // แปลงระยะทางจากเมตรเป็นกิโลเมตร
+                distanceKm: Number((route.distance / 1000).toFixed(2)),
+                // แปลงเวลาจากวินาทีเป็นนาที
+                durationMin: Number((route.duration / 60).toFixed(1)),
+            };
+        }
+        return null;
+    } catch (error) {
+        console.error("OSRM API Fetch Error:", error);
+        return null; // ถ้า API มีปัญหา ให้ return null เพื่อไปใช้ Fallback
+    }
+}
+
 //คำนวณระยะทาง ระหว่างจุด 2 จุดจากพิกัด
 function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
     const R = 6371; // รัศมีของโลก (กม.)
@@ -222,6 +249,13 @@ router.post("/optimize", async (req, res) => {
 
             const sortedGroup = sortStops(rawGroup, shopLat, shopLng);
 
+             const routeCoords: Array<[number, number]> = [
+                [shopLat, shopLng],
+                ...sortedGroup.map((order: any) => [Number(order.latitude), Number(order.longitude)] as [number, number]),
+            ];
+
+            const osrmResult = await getOSRMRoute(routeCoords);
+
             let totalGroupBoxes = 0;
             let totalGroupDistance = 0;
             let cumulativeTime = 0;
@@ -255,7 +289,13 @@ router.post("/optimize", async (req, res) => {
                 previousLng = curLng;
             }
 
-            totalGroupDistance = Number(totalGroupDistance.toFixed(2));
+            if (osrmResult) {
+                totalGroupDistance = osrmResult.distanceKm;
+                cumulativeTime = osrmResult.durationMin;
+            } else {
+                totalGroupDistance = Number(totalGroupDistance.toFixed(2));
+            }
+
             const timeDelivery = Number(cumulativeTime.toFixed(1));
 
             const deliveryFee = Number(
@@ -265,7 +305,6 @@ router.post("/optimize", async (req, res) => {
             const netProfit = Number(
                 (totalGroupBoxes * (SHOP_CONFIG.box_price - SHOP_CONFIG.food_cost) - deliveryFee).toFixed(2)
             );
-
             const insertRouteSql = `
                 INSERT INTO delivery_routes (rider_id, job_code, total_orders, total_boxes, total_distance, time_delivery, delivery_peice, net_profit, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
