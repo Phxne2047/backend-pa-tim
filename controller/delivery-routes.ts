@@ -25,14 +25,14 @@ async function getOSRMRoute(coordinates: Array<[number, number]>): Promise<{ dis
         }
         return null;
     } catch (error) {
-        console.error("OSRM API Fetch Error:", error);
+        console.error("ดึง OSRM ไม่ได้:", error);
         return null;
     }
 }
 
 //คำนวณระยะทาง ระหว่างจุด 2 จุดจากพิกัด
 function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-    const R = 6371; // รัศมีของโลก (กม.)
+    const R = 6371;
     const dLat = ((lat2 - lat1) * Math.PI) / 180;
     const dLon = ((lon2 - lon1) * Math.PI) / 180;
 
@@ -46,11 +46,9 @@ function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: numbe
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     const straightDist = R * c;
 
-    // คูณ 1.35 เพื่อชดเชยระยะทางโค้งตามถนนจริง
     return Number((straightDist * 1.35).toFixed(2));
 }
 
-//คำนวณเวลาเดินทาง ขับ 30 กม./ชม. (1 กม. = 2 นาที)
 function calculateDuration(distanceKm: number): number {
     return Number((distanceKm * 2).toFixed(1));
 }
