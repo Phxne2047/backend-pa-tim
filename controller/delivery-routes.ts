@@ -7,10 +7,9 @@ import { SHOP_CONFIG } from "../config/shop";
 export const router = express.Router();
 
 
-// ฟังก์ชันดึงระยะทางถนนจริงและเวลาเดินทางจริงจาก OSRM API
+//OSRM API
 async function getOSRMRoute(coordinates: Array<[number, number]>): Promise<{ distanceKm: number; durationMin: number } | null> {
     try {
-        // OSRM รับพิกัดในรูปแบบ longitude,latitude
         const coordString = coordinates.map(c => `${c[1]},${c[0]}`).join(";");
         const url = `https://router.project-osrm.org/route/v1/driving/${coordString}?overview=false`;
 
@@ -20,16 +19,14 @@ async function getOSRMRoute(coordinates: Array<[number, number]>): Promise<{ dis
         if (data.code === "Ok" && data.routes && data.routes.length > 0) {
             const route = data.routes[0];
             return {
-                // แปลงระยะทางจากเมตรเป็นกิโลเมตร
                 distanceKm: Number((route.distance / 1000).toFixed(2)),
-                // แปลงเวลาจากวินาทีเป็นนาที
                 durationMin: Number((route.duration / 60).toFixed(1)),
             };
         }
         return null;
     } catch (error) {
         console.error("OSRM API Fetch Error:", error);
-        return null; // ถ้า API มีปัญหา ให้ return null เพื่อไปใช้ Fallback
+        return null;
     }
 }
 
