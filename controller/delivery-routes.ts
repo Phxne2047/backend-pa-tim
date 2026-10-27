@@ -84,6 +84,23 @@ function groupOrdersForRiders(orders: any[]): any[][] {
     return groups;
 }
 
+function getPermutations<T>(arr: T[]): T[][] {
+    if (arr.length <= 1) return [arr];
+    const result: T[][] = [];
+
+    for (let i = 0; i < arr.length; i++) {
+        const current = arr[i]!;
+        const remaining = [...arr.slice(0, i), ...arr.slice(i + 1)];
+        const remainingPerms = getPermutations(remaining);
+
+        for (const perm of remainingPerms) {
+            result.push([current, ...perm]);
+        }
+    }
+
+    return result;
+}
+
 //เรียงลำดับจุดส่งในกลุ่มให้สั้นที่สุด
 function sortStops(stops: any[], shopLat: number, shopLng: number): any[] {
     if (stops.length <= 1) return stops;
@@ -102,11 +119,7 @@ function sortStops(stops: any[], shopLat: number, shopLng: number): any[] {
     }
 
     //กรณีมี 3 จุด
-    const permutations = [
-        [0, 1, 2], [0, 2, 1],
-        [1, 0, 2], [1, 2, 0],
-        [2, 0, 1], [2, 1, 0],
-    ];
+    const permutations = getPermutations([0, 1, 2]);
 
     let bestStops = [stops[0], stops[1], stops[2]];
     let minDistance = Infinity;
