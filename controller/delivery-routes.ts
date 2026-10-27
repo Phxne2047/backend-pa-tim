@@ -105,46 +105,30 @@ function getPermutations<T>(arr: T[]): T[][] {
 function sortStops(stops: any[], shopLat: number, shopLng: number): any[] {
     if (stops.length <= 1) return stops;
 
-    //กรณีมี 2 จุด
-    if (stops.length === 2) {
-        const d1 =
-            calculateDistance(shopLat, shopLng, Number(stops[0].latitude), Number(stops[0].longitude)) +
-            calculateDistance(Number(stops[0].latitude), Number(stops[0].longitude), Number(stops[1].latitude), Number(stops[1].longitude));
-
-        const d2 =
-            calculateDistance(shopLat, shopLng, Number(stops[1].latitude), Number(stops[1].longitude)) +
-            calculateDistance(Number(stops[1].latitude), Number(stops[1].longitude), Number(stops[0].latitude), Number(stops[0].longitude));
-
-        return d1 <= d2 ? [stops[0], stops[1]] : [stops[1], stops[0]];
-    }
-
-    //กรณีมี 3 จุด
-    const permutations = getPermutations([0, 1, 2]);
-
-    let bestStops = [stops[0], stops[1], stops[2]];
+    const allRoutes = getPermutations(stops);
+    let bestRoute = stops;
     let minDistance = Infinity;
 
-    for (const p of permutations) {
-        const idx0 = p[0]!;
-        const idx1 = p[1]!;
-        const idx2 = p[2]!;
+    for (const route of allRoutes) {
+        let totalDist = 0;
+        let prevLat = shopLat;
+        let prevLng = shopLng;
 
-        const s1 = stops[idx0]!;
-        const s2 = stops[idx1]!;
-        const s3 = stops[idx2]!;
-
-        const totalDist =
-            calculateDistance(shopLat, shopLng, Number(s1.latitude), Number(s1.longitude)) +
-            calculateDistance(Number(s1.latitude), Number(s1.longitude), Number(s2.latitude), Number(s2.longitude)) +
-            calculateDistance(Number(s2.latitude), Number(s2.longitude), Number(s3.latitude), Number(s3.longitude));
+        for (const stop of route) {
+            const curLat = Number(stop.latitude);
+            const curLng = Number(stop.longitude);
+            totalDist += calculateDistance(prevLat, prevLng, curLat, curLng);
+            prevLat = curLat;
+            prevLng = curLng;
+        }
 
         if (totalDist < minDistance) {
             minDistance = totalDist;
-            bestStops = [s1, s2, s3];
+            bestRoute = route;
         }
     }
 
-    return bestStops;
+    return bestRoute;
 }
 
 router.get("/", async (req, res) => {
