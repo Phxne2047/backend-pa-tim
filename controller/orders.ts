@@ -32,7 +32,7 @@ const MENUS = [
     "ข้าวพริกแกงหมูใส่ถั่ว",
 ];
 
-//use
+// USE
 router.get("/", async (req, res) => {
     const shopLat = SHOP_CONFIG.latitude
     const shopLng = SHOP_CONFIG.longitude
@@ -46,7 +46,7 @@ router.get("/", async (req, res) => {
 
 router.get("/near", async (req, res) => {
     try {
-        const distanceKm = req.query.km ? parseFloat(req.query.km as string) : 2.0;
+        const distanceKm = req.query.km ? parseFloat(req.query.km as string) : 3.0;
         const targetLat = req.query.lat ? parseFloat(req.query.lat as string) : SHOP_CONFIG.latitude;
         const targetLng = req.query.lng ? parseFloat(req.query.lng as string) : SHOP_CONFIG.longitude;
 
@@ -57,7 +57,7 @@ router.get("/near", async (req, res) => {
             FROM orders o
             INNER JOIN customers c ON o.customer_id = c.id
             HAVING distance_km <= ?
-            ORDER BY o.id ASC
+            ORDER BY o.id ASC 
         `;
 
         const [rows]: any = await conn.query(sql, [targetLng, targetLat, distanceKm]);
@@ -89,51 +89,52 @@ router.get("/:id", async (req, res) => {
     }
 });
 
-//mock
+//USE
 router.post("/mock", async (req, res) => {
     try {
         let body: OrderMockRequests = req.body || {};
-        let count = Math.floor(Math.random() * 11) + 20; // 20 - 30 รายการ
+        let count = Math.floor(Math.random() * 11) + 20;
         const clearExisting = body.clear_existing !== undefined ? body.clear_existing : true;
-        //ดึงรายชื่อลูกค้าที่มีอยู่ในระบบ
-        const [customerRows]: any = await conn.query("SELECT * FROM customers");
-        const customers: Customer[] = customerRows;
 
+        const shopLat = SHOP_CONFIG.latitude;
+        const shopLng = SHOP_CONFIG.longitude;
+
+        const sqlCustomers = `
+            SELECT *, 
+            ROUND((ST_Distance_Sphere(point(longitude, latitude), point(?, ?)) / 1000), 2) AS distance_km 
+            FROM customers 
+            HAVING distance_km <= 3.0
+        `;
+        const [customerRows]: any = await conn.query(sqlCustomers, [shopLng, shopLat]);
+        const customers: Customer[] = customerRows;
         if (customers.length === 0) {
             return res.status(400).json({
-                error: "No customers found in database to simulate orders from.",
+                error: "ไม่พบลูกค้าที่อยู่ในรัศมี 3 กิโลเมตรสำหรับจำลองออเดอร์",
             });
         }
         if (clearExisting) {
-            // ปิดการตรวจสอบ Foreign Key ชั่วคราว
             await conn.query("SET FOREIGN_KEY_CHECKS = 0;");
-
-            // ใช้ TRUNCATE เพื่อลบข้อมูลและรีเซ็ต ID เริ่มต้นที่ 1 ใหม่
-            await conn.query("TRUNCATE TABLE route_stops;");
-            await conn.query("TRUNCATE TABLE delivery_routes;");
-            await conn.query("TRUNCATE TABLE orders;");
-
-            // เปิดการตรวจสอบ Foreign Key กลับมา
+            await conn.query("DELETE FROM route_stops;");
+            await conn.query("DELETE FROM orders;");
+            await conn.query("ALTER TABLE orders AUTO_INCREMENT = 1;");
             await conn.query("SET FOREIGN_KEY_CHECKS = 1;");
         }
-
         const createdOrders: any[] = [];
         const baseTime = new Date();
 
         const shuffledCustomers = [...customers].sort(() => Math.random() - 0.5);
-
-        for (let i = 0; i < count; i++) {
+        for (let i = 0; i < count; i++) {   
             const customer = shuffledCustomers[i % shuffledCustomers.length]!;
             const boxes = Math.floor(Math.random() * 3) + 1;
             const menu = MENUS[Math.floor(Math.random() * MENUS.length)] || "ข้าวกะเพราหมูกรอบไข่ดาว";
             const orderTime = new Date(baseTime.getTime() + (i * 60 + Math.floor(Math.random() * 45)) * 1000);
             const status = "pending";
+            
             const insertSql = `
                 INSERT INTO orders (customer_id, boxes, status, menu, created_at)
                 VALUES (?, ?, ?, ?, ?)
             `;
             const [result]: any = await conn.query(insertSql, [customer.id, boxes, status, menu, orderTime]);
-
             createdOrders.push({
                 id: result.insertId,
                 customer_id: customer.id,
@@ -147,7 +148,7 @@ router.post("/mock", async (req, res) => {
             });
         }
         res.status(201).json({
-            message: `Successfully simulated ${createdOrders.length} orders.`,
+            message: `Successfully simulated ${createdOrders.length} orders within 3 km.`,
             count: createdOrders.length,
             orders: createdOrders,
         });
@@ -159,32 +160,58 @@ router.post("/mock", async (req, res) => {
     }
 });
 
-//use
+
+//USE
 router.post("/", async (req, res) => {
     try {
         let order: OrdersPostRequests = req.body;
-
-        if (order.boxes > 3) {
-            return res.status(400).json({ error: "An order cannot contain more than 3 boxes" });
+        const boxesToAdd = Number(order.boxes) || 1;
+        if (boxesToAdd > 3 || boxesToAdd < 1) {
+            return res.status(400).json({ error: "จำนวนกล่องต้องอยู่ระหว่าง 1 ถึง 3 กล่อง" });
         }
 
-        let sql =
-            "INSERT INTO `orders`(`customer_id`, `boxes`, `status`, `menu`) VALUES (?,?,?,?)";
+        const [existingRows]: any = await conn.query(
+            "SELECT * FROM orders WHERE customer_id = ? ORDER BY id DESC LIMIT 1",
+            [order.customer_id]
+        );
 
-        const [result] = await conn.query(sql, [
+        if (existingRows && existingRows.length > 0) {
+            const existingOrder = existingRows[0];
+            const totalBoxes = existingOrder.boxes + boxesToAdd;
+
+            if (totalBoxes > 3) {
+                return res.status(400).json({
+                    error: `ลูกค้ารายนี้มีออร์เดอร์อยู่แล้ว ${existingOrder.boxes} กล่อง สั่งเพิ่มอีก ${boxesToAdd} กล่องไม่ได้ (รวมเกิน 3 กล่อง)`
+                });
+            }
+
+            const updateSql = "UPDATE orders SET boxes = ?, menu = ? WHERE id = ?";
+            await conn.query(updateSql, [totalBoxes, order.menu || existingOrder.menu, existingOrder.id]);
+            return res.status(200).json({
+                message: "อัปเดตออร์เดอร์เดิมของลูกค้าสำเร็จ",
+                order_id: existingOrder.id,
+                total_boxes: totalBoxes,
+                affected_row: 1,
+                is_updated: true
+            });
+        }
+
+        const insertSql =
+            "INSERT INTO `orders`(`customer_id`, `boxes`, `status`, `menu`) VALUES (?,?,?,?)";
+        const [result]: any = await conn.query(insertSql, [
             order.customer_id,
-            order.boxes,
-            order.status,
+            boxesToAdd,
+            order.status || 'pending',
             order.menu,
         ]);
-
-        // แปลงผลลัพธ์เพื่อนำมาสกัดหาข้อมูลแถวที่ทำรายการสำเร็จ
-        const insertResult = result as any;
         res.status(201).json({
-            affected_row: insertResult.affectedRows, // จำนวนแถวที่ได้รับผลกระทบ (สำเร็จ = 1)
-            last_idx: insertResult.insertId // รหัสไอดีล่าสุดที่ระบบสร้างขึ้นให้อัตโนมัติ (Auto increment id)
+            message: "สร้างออร์เดอร์ใหม่สำเร็จ",
+            affected_row: result.affectedRows,
+            last_idx: result.insertId,
+            is_updated: false
         });
     } catch (error) {
+        console.error("Error creating/updating order:", error);
         res.status(500).json({ error: "Internal server error" });
     }
 });
@@ -193,9 +220,10 @@ router.delete("/all", async (req, res) => {
     try {
         await conn.query("DELETE FROM route_stops");
         const [result] = await conn.query("DELETE FROM orders");
+        
+        await conn.query("ALTER TABLE orders AUTO_INCREMENT = 1;");
         const deleteResult = result as any;
 
-        // ตรวจเช็กสักนิดว่ามีแถวถูกลบจริงไหม หากไม่มีแสดงว่าไม่พบไอดีในฐานข้อมูล ส่งกลับรหัส 404
         if (deleteResult.affectedRows === 0) {
             return res.status(404).json({ error: "No orders found" });
         }
@@ -205,16 +233,16 @@ router.delete("/all", async (req, res) => {
     }
 });
 
-//use
+//USE
 router.delete("/:id", async (req, res) => {
     try {
         let id = req.params.id
-        // ลบจาก route_stops ก่อนหากมีอ้างอิงอยู่
+
         await conn.query("DELETE FROM route_stops WHERE order_id = ?", [id]);
         const [result] = await conn.query("DELETE FROM orders WHERE id = ?", [id]);
         const deleteResult = result as any;
 
-        // ตรวจเช็กสักนิดว่ามีแถวถูกลบจริงไหม หากไม่มีแสดงว่าไม่พบไอดีในฐานข้อมูล ส่งกลับรหัส 404
+
         if (deleteResult.affectedRows === 0) {
             return res.status(404).json({ error: "Order not found" });
         }
@@ -228,26 +256,24 @@ router.delete("/:id", async (req, res) => {
 router.put("/:id", async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
-
-        // 1. ค้นหาข้อมูลเดิมก่อน เพื่อตรวจว่ามี ID นี้จริงไหม
+        let order: Orders = req.body;
         const [existingRows]: any = await conn.query("SELECT * FROM orders WHERE id = ?", [id]);
         if (!existingRows || existingRows.length === 0) {
             return res.status(404).json({ error: "Order not found" });
         }
 
+        if (order.boxes !== undefined && (order.boxes > 3 || order.boxes < 1)) {
+            return res.status(400).json({ error: "จำนวนกล่องต้องอยู่ระหว่าง 1 ถึง 3 กล่องเท่านั้น" });
+        }
         const existingOrder: Orders = existingRows[0];
-        let order: Orders = req.body;
 
-        // 2. ใช้ค่าใหม่ หรือสำรองด้วยค่าเดิมถ้าไม่ได้ส่งฟิลด์นั้นมา
         const updatedCustomerId = order.customer_id !== undefined ? order.customer_id : existingOrder.customer_id;
         const updatedBoxes = order.boxes !== undefined ? order.boxes : existingOrder.boxes;
         const updatedStatus = order.status !== undefined ? order.status : existingOrder.status;
         const updatedMenu = order.menu !== undefined ? order.menu : existingOrder.menu;
 
-        // 3. ทำการ Update
         let sql =
             "UPDATE `orders` SET `customer_id`=?, `boxes`=?, `status`=?, `menu`=? WHERE `id`=?";
-
         const [result]: any = await conn.query(sql, [
             updatedCustomerId,
             updatedBoxes,
@@ -255,7 +281,6 @@ router.put("/:id", async (req, res) => {
             updatedMenu,
             id,
         ]);
-
         res.status(200).json({
             message: "Order updated successfully",
             affected_row: result.affectedRows,
@@ -266,14 +291,16 @@ router.put("/:id", async (req, res) => {
     }
 });
 
-
-//use
+//USE
 router.patch("/:id", async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
         const order: Orders = req.body;
 
-        // 1. ค้นหาข้อมูลเก่าจากไอดีที่ต้องการอัปเดตก่อน
+        if (order.boxes !== undefined && (order.boxes > 3 || order.boxes < 1)) {
+            return res.status(400).json({ error: "จำนวนกล่องต้องอยู่ระหว่าง 1 ถึง 3 กล่องเท่านั้น" });
+        }
+
         let sql = mysql.format("SELECT * FROM orders WHERE id = ?", [id]);
         let [response] = await conn.query(sql);
         let result = response as Orders[];
@@ -281,10 +308,8 @@ router.patch("/:id", async (req, res) => {
         if (result.length > 0) {
             let OrdersOriginal = result[0];
 
-            // 2. นำข้อมูลเก่ามาทับด้วยข้อมูลใหม่ที่ส่งมา (ค่าไหนไม่ส่งมาก็จะใช้ค่าเก่าของเดิม)
             let updateOrders = { ...OrdersOriginal, ...order };
 
-            // 3. เขียนข้อมูลที่รวมสำเร็จแล้วกลับลงไปในฐานข้อมูล
             sql =
                 "UPDATE `orders` SET `customer_id`=?, `boxes`=?, `status`=?, `menu`=? WHERE `id`=?";
             sql = mysql.format(sql, [
